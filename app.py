@@ -1,0 +1,99 @@
+import io
+import pandas as pd
+import streamlit as st
+
+st.set_page_config(page_title="MAWB Audit Analyzer", layout="wide")
+st.title("MAWB Audit Analyzer (Billing-only)")
+
+REQUIRED_COLS = ["MAWB", "Cost Amount", "Sell Amount"]
+
+uploaded = st.file_uploader("Upload Billing Charges Excel (.xlsx)", type=["xlsx"])
+
+def find_sheet_with_cols(xls: pd.ExcelFile, required_cols: list[str]) -> str:
+    for sheet in xls.sheet_names:
+        df = pd.read_excel(xls, sheet_name=sheet, nrows=50)
+        cols = set(df.columns.astype(str))
+        if all(c in cols for c in required_cols):
+            return sheet
+    return ""
+
+def safe_numeric(s: pd.Series) -> pd.Series:
+    return pd.to_numeric(s, errors="coerce").fillna(0)
+
+if uploaded:
+    xls = pd.ExcelFile(uploaded)
+    sheet = find_sheet_with_cols(xls, REQUIRED_COLS)
+    if not sheet:
+        st.error("Cannot find required columns: " + ", ".join(REQUIRED_COLS))
+        st.stop()
+
+    df = pd.read_excel(xls, sheet_name=sheet)
+
+    df["MAWB"] = df["MAWB"].astype(str).str.strip()
+    df["Cost Amount"] = safe_numeric(df["Cost Amount"])
+    df["Sell Amount"] = safe_numeric(df["Sell Amount"])
+    df = df[df["MAWB"].ne("") & df["MAWB"].ne("nan")]
+
+    summary = (
+        df.groupby("MAWB", as_index=False)
+          .agg(Total_Cost=("Cost Amount", "sum"),
+               Total_Sell=("Sell Amount", "sum"),
+               Line_Count=("MAWB", "size"))
+    )
+
+    summary["Classification"] = summary.apply(
+        lambda r: "Closed" if (r["Total_Cost"] > 0 and r["Total_Sell"] > 0) else "Open",
+        axis=1
+    )
+
+    def exception_type(r):
+        if r["Total_Cost"] == 0 and r["Total_Sell"] == 0:
+            return "Cost=Sell=0"
+        if r["Total_Sell"] == 0:
+            return "Revenue=0"
+        if r["Total_Cost"] == 0:
+            return "Cost=0"
+        return ""
+
+    summary["Exception_Type"] = summary.apply(exception_type, axis=1)
+    exceptions = summary[summary["Classification"].eq("Open")].copy()
+
+    total_mawb = len(summary)
+    closed_cnt = int((summary["Classification"] == "Closed").sum())
+
+    kpi = pd.DataFrame([{
+        "Total MAWB": total_mawb,
+        "Closed Count": closed_cnt,
+        "Closed %": (closed_cnt / total_mawb) if total_mawb else 0,
+        "Open Count": total_mawb - closed_cnt,
+        "Revenue=0 Count": int((summary["Exception_Type"] == "Revenue=0").sum()),
+        "Cost=0 Count": int((summary["Exception_Type"] == "Cost=0").sum()),
+        "Cost=Sell=0 Count": int((summary["Exception_Type"] == "Cost=Sell=0").sum()),
+        "Total Cost": float(summary["Total_Cost"].sum()),
+        "Total Sell": float(summary["Total_Sell"].sum()),
+    }])
+
+    c1, c2 = st.columns([1, 1])
+    with c1:
+        st.subheader("KPI Summary")
+        st.dataframe(kpi, use_container_width=True)
+    with c2:
+        st.subheader("Exceptions (Open items)")
+        st.dataframe(exceptions, use_container_width=True)
+
+    st.subheader("MAWB Summary (All)")
+    st.dataframe(summary, use_container_width=True)
+
+    output = io.BytesIO()
+    with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
+        kpi.to_excel(writer, index=False, sheet_name="KPI")
+        summary.to_excel(writer, index=False, sheet_name="MAWB_Summary")
+        exceptions.to_excel(writer, index=False, sheet_name="Exceptions")
+        df.to_excel(writer, index=False, sheet_name="Raw_Billing")
+
+    st.download_button(
+        "Download Report Excel",
+        data=output.getvalue(),
+        file_name="MAWB_Audit_Report.xlsx",
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
