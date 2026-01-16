@@ -42,6 +42,9 @@ def find_sheet_with_required_cols(xls: pd.ExcelFile, required_candidates: dict) 
     return ""
 
 def clean_eta_series(s: pd.Series) -> pd.Series:
+    """
+    Robust ETA parser (text) + normalize to DATE (no time).
+    """
     s = s.astype(str).fillna("").str.strip()
     s = s.str.replace(r"(?i)^\s*eta\s*[:\-]\s*", "", regex=True)
     s = s.str.replace(r"\s+", " ", regex=True)
@@ -58,6 +61,9 @@ def clean_eta_series(s: pd.Series) -> pd.Series:
     if mask.any():
         dt2 = pd.to_datetime(s2[mask], errors="coerce", dayfirst=True, infer_datetime_format=True)
         dt1.loc[mask] = dt2
+
+    # ✅ keep DATE only (strip time)
+    dt1 = dt1.dt.normalize()
     return dt1
 
 def pct(numer: pd.Series, denom: pd.Series) -> pd.Series:
@@ -101,6 +107,17 @@ def parse_mawb_list(text: str) -> list[str]:
     tokens = [normalize_mawb(t) for t in tokens if str(t).strip()]
     tokens = [t for t in tokens if t]
     return sorted(set(tokens))
+
+def to_date_only(df_in: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
+    """
+    For export/UI display: convert datetime column(s) to pure date object (YYYY-MM-DD in Excel),
+    avoiding 00:00:00 display.
+    """
+    df_out = df_in.copy()
+    for c in cols:
+        if c in df_out.columns:
+            df_out[c] = pd.to_datetime(df_out[c], errors="coerce").dt.date
+    return df_out
 
 # ---------------- Uploaders ----------------
 billing_file = st.file_uploader("Upload Billing Charges Excel (.xlsx)", type=["xlsx"], key="billing")
@@ -226,6 +243,7 @@ try:
                 mdf.columns = ["MAWB", "ETA"]
                 mdf["MAWB"] = mdf["MAWB"].apply(normalize_mawb)
 
+                # ✅ parse + normalize to DATE only
                 mdf["ETA"] = clean_eta_series(mdf["ETA"])
 
                 bad_eta_rows = int(mdf["ETA"].isna().sum())
@@ -235,7 +253,7 @@ try:
                         f"ETA parsing note: {bad_eta_rows} / {total_rows} ETA values could not be parsed and were left blank."
                     )
 
-                # Same MAWB multiple rows: latest ETA (max)
+                # Same MAWB multiple rows: latest ETA (max) (date-only already)
                 eta_map = (
                     mdf.dropna(subset=["MAWB"])
                        .groupby("MAWB", as_index=False)["ETA"]
@@ -247,6 +265,9 @@ try:
         df = df.merge(eta_map, on="MAWB", how="left")
     else:
         df["ETA"] = pd.NaT
+
+    # ✅ Ensure ETA in df is DATE-only as well (even if came with time)
+    df["ETA"] = pd.to_datetime(df["ETA"], errors="coerce").dt.normalize()
 
     # ---- MAWB summary ----
     summary = (
@@ -265,11 +286,16 @@ try:
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
     summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
-    # Classification / Exceptions
-    summary["Classification"] = summary.apply(
-        lambda r: "Closed" if (r["Total_Cost"] > 0 and r["Total_Sell"] > 0) else "Open",
-        axis=1
-    )
+    # ✅ Classification / Exceptions (PM must be in 30%~80% to be Closed)
+    def is_closed(r):
+        if not (r["Total_Cost"] > 0 and r["Total_Sell"] > 0):
+            return "Open"
+        pm = r["Profit Margin %"]
+        if (pm < 0.30) or (pm > 0.80):
+            return "Open"
+        return "Closed"
+
+    summary["Classification"] = summary.apply(is_closed, axis=1)
 
     def exception_type(r):
         if r["Total_Cost"] == 0 and r["Total_Sell"] == 0:
@@ -278,6 +304,12 @@ try:
             return "Revenue=0"
         if r["Total_Cost"] == 0:
             return "Cost=0"
+
+        # ✅ New: Margin out of range (exclude pm=0 to avoid Sell=0 impact)
+        pm = r["Profit Margin %"]
+        if (pm != 0) and ((pm < 0.30) or (pm > 0.80)):
+            return "Margin_Out_of_Range"
+
         return ""
 
     summary["Exception_Type"] = summary.apply(exception_type, axis=1)
@@ -335,7 +367,6 @@ try:
 
     # Charge code exception counts (MAWB-level flags)
     mawb_flags = summary[["MAWB", "Exception_Type"]].copy()
-    # link MAWB -> charge codes (many-to-many): count MAWBs with a charge code appearing
     mawb_charge = df[["MAWB", "Charge Code"]].drop_duplicates()
 
     cc_exc = mawb_charge.merge(mawb_flags, on="MAWB", how="left")
@@ -348,7 +379,6 @@ try:
             fill_value=0
         ).reset_index()
     )
-
     chargecode_summary = chargecode_summary.merge(chargecode_exceptions, on="Charge Code", how="left").fillna(0)
 
     # ---- D: Vendor Summary ----
@@ -378,6 +408,26 @@ try:
     )
     vendor_summary = vendor_summary.merge(vendor_exceptions, on="Vendor", how="left").fillna(0)
 
+    # ✅ NEW: Charge Code Profit <= 0 by MAWB (tab)
+    cc_mawb = (
+        df.groupby(["MAWB", "Charge Code"], as_index=False)
+          .agg(
+              Client=("Client", "first"),
+              Vendor=("Vendor", "first"),
+              Total_Cost=("Cost Amount", "sum"),
+              Total_Sell=("Sell Amount", "sum"),
+              ETA=("ETA", "max"),
+          )
+    )
+    cc_mawb["Profit"] = cc_mawb["Total_Sell"] - cc_mawb["Total_Cost"]
+    cc_mawb["Profit Margin %"] = pct(cc_mawb["Profit"], cc_mawb["Total_Sell"])
+    cc_mawb["ETA Month"] = pd.to_datetime(cc_mawb["ETA"], errors="coerce").dt.to_period("M").astype(str).replace("NaT", "")
+
+    chargecode_profit_le0_mawb = cc_mawb[cc_mawb["Profit"] <= 0].copy()
+    chargecode_profit_le0_mawb = chargecode_profit_le0_mawb.sort_values(
+        ["Profit", "Total_Sell"], ascending=[True, False]
+    )
+
     # ---- KPI ----
     total_mawb = len(summary)
     closed_cnt = int((summary["Classification"] == "Closed").sum())
@@ -393,6 +443,7 @@ try:
         "Revenue=0 Count": int((summary["Exception_Type"] == "Revenue=0").sum()),
         "Cost=0 Count": int((summary["Exception_Type"] == "Cost=0").sum()),
         "Cost=Sell=0 Count": int((summary["Exception_Type"] == "Cost=Sell=0").sum()),
+        "Margin_Out_of_Range Count": int((summary["Exception_Type"] == "Margin_Out_of_Range").sum()),
         "Total Cost": float(summary["Total_Cost"].sum()),
         "Total Sell": total_sell_sum,
         "Total Profit": total_profit_sum,
@@ -417,37 +468,37 @@ try:
         st.dataframe(exceptions, use_container_width=True)
 
     st.subheader("MAWB Summary (All)")
-    st.dataframe(summary, use_container_width=True)
+    st.dataframe(to_date_only(summary, ["ETA"]), use_container_width=True)
 
     st.subheader("Client Profit Summary")
-    st.dataframe(client_summary, use_container_width=True)
+    st.dataframe(to_date_only(client_summary, ["Latest_ETA"]), use_container_width=True)
 
     st.subheader("Profit Margin Outliers (PM<30% or PM>80%, PM!=0)")
-    st.dataframe(margin_outliers, use_container_width=True)
+    st.dataframe(to_date_only(margin_outliers, ["ETA"]), use_container_width=True)
 
     st.subheader("Negative Profit (Profit < 0)")
-    st.dataframe(negative_profit, use_container_width=True)
+    st.dataframe(to_date_only(negative_profit, ["ETA"]), use_container_width=True)
 
     st.subheader("Zero Margin (Profit Margin % = 0)")
-    st.dataframe(zero_margin, use_container_width=True)
+    st.dataframe(to_date_only(zero_margin, ["ETA"]), use_container_width=True)
 
     st.subheader("Zero Profit (Profit = 0)")
-    st.dataframe(zero_profit, use_container_width=True)
+    st.dataframe(to_date_only(zero_profit, ["ETA"]), use_container_width=True)
 
     st.subheader("Sell = 0 (Total_Sell = 0)")
-    st.dataframe(sell_zero, use_container_width=True)
+    st.dataframe(to_date_only(sell_zero, ["ETA"]), use_container_width=True)
 
     st.subheader("Cost = 0 (Total_Cost = 0)")
-    st.dataframe(cost_zero, use_container_width=True)
+    st.dataframe(to_date_only(cost_zero, ["ETA"]), use_container_width=True)
 
     st.subheader("Both Zero (Total_Sell=0 and Total_Cost=0)")
-    st.dataframe(both_zero, use_container_width=True)
+    st.dataframe(to_date_only(both_zero, ["ETA"]), use_container_width=True)
 
     st.subheader("Sell=0 ONLY (Total_Sell=0 and Total_Cost>0)")
-    st.dataframe(sell_zero_only, use_container_width=True)
+    st.dataframe(to_date_only(sell_zero_only, ["ETA"]), use_container_width=True)
 
     st.subheader("Cost=0 ONLY (Total_Cost=0 and Total_Sell>0)")
-    st.dataframe(cost_zero_only, use_container_width=True)
+    st.dataframe(to_date_only(cost_zero_only, ["ETA"]), use_container_width=True)
 
     st.subheader("Charge Code Summary (D)")
     st.dataframe(chargecode_summary, use_container_width=True)
@@ -455,32 +506,56 @@ try:
     st.subheader("Vendor Summary (D)")
     st.dataframe(vendor_summary, use_container_width=True)
 
+    # ✅ NEW TAB UI
+    st.subheader("Charge Code Profit <= 0 (by MAWB)")
+    st.dataframe(to_date_only(chargecode_profit_le0_mawb, ["ETA"]), use_container_width=True)
+
     # ---------------- Export ----------------
     output = io.BytesIO()
+
+    # For export: convert ETA columns to DATE (no time display)
+    summary_x = to_date_only(summary, ["ETA"])
+    margin_outliers_x = to_date_only(margin_outliers, ["ETA"])
+    negative_profit_x = to_date_only(negative_profit, ["ETA"])
+    zero_margin_x = to_date_only(zero_margin, ["ETA"])
+    zero_profit_x = to_date_only(zero_profit, ["ETA"])
+    sell_zero_x = to_date_only(sell_zero, ["ETA"])
+    cost_zero_x = to_date_only(cost_zero, ["ETA"])
+    both_zero_x = to_date_only(both_zero, ["ETA"])
+    sell_zero_only_x = to_date_only(sell_zero_only, ["ETA"])
+    cost_zero_only_x = to_date_only(cost_zero_only, ["ETA"])
+    exceptions_x = to_date_only(exceptions, ["ETA"])
+    client_summary_x = to_date_only(client_summary, ["Latest_ETA"])
+    df_x = to_date_only(df, ["ETA"])
+    chargecode_profit_le0_mawb_x = to_date_only(chargecode_profit_le0_mawb, ["ETA"])
+
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         kpi.to_excel(writer, index=False, sheet_name="KPI")
-        summary.to_excel(writer, index=False, sheet_name="MAWB_Summary")
-        client_summary.to_excel(writer, index=False, sheet_name="Client_Summary")
-        exceptions.to_excel(writer, index=False, sheet_name="Exceptions")
+        summary_x.to_excel(writer, index=False, sheet_name="MAWB_Summary")
+        client_summary_x.to_excel(writer, index=False, sheet_name="Client_Summary")
+        exceptions_x.to_excel(writer, index=False, sheet_name="Exceptions")
 
-        margin_outliers.to_excel(writer, index=False, sheet_name="Margin_Outliers")
-        negative_profit.to_excel(writer, index=False, sheet_name="Negative_Profit")
+        margin_outliers_x.to_excel(writer, index=False, sheet_name="Margin_Outliers")
+        negative_profit_x.to_excel(writer, index=False, sheet_name="Negative_Profit")
 
-        zero_margin.to_excel(writer, index=False, sheet_name="Zero_Margin")
-        zero_profit.to_excel(writer, index=False, sheet_name="Zero_Profit")
-        sell_zero.to_excel(writer, index=False, sheet_name="Sell_Zero")
-        cost_zero.to_excel(writer, index=False, sheet_name="Cost_Zero")
-        both_zero.to_excel(writer, index=False, sheet_name="Both_Zero")
-        sell_zero_only.to_excel(writer, index=False, sheet_name="Sell_Zero_Only")
-        cost_zero_only.to_excel(writer, index=False, sheet_name="Cost_Zero_Only")
+        zero_margin_x.to_excel(writer, index=False, sheet_name="Zero_Margin")
+        zero_profit_x.to_excel(writer, index=False, sheet_name="Zero_Profit")
+        sell_zero_x.to_excel(writer, index=False, sheet_name="Sell_Zero")
+        cost_zero_x.to_excel(writer, index=False, sheet_name="Cost_Zero")
+        both_zero_x.to_excel(writer, index=False, sheet_name="Both_Zero")
+        sell_zero_only_x.to_excel(writer, index=False, sheet_name="Sell_Zero_Only")
+        cost_zero_only_x.to_excel(writer, index=False, sheet_name="Cost_Zero_Only")
 
         chargecode_summary.to_excel(writer, index=False, sheet_name="ChargeCode_Summary")
         vendor_summary.to_excel(writer, index=False, sheet_name="Vendor_Summary")
 
+        # ✅ NEW SHEET
+        chargecode_profit_le0_mawb_x.to_excel(writer, index=False, sheet_name="ChargeCode_ProfitLE0_MAWB")
+
         if mawb_keep:
             pd.DataFrame({"MAWB": mawb_not_found}).to_excel(writer, index=False, sheet_name="MAWB_Not_Found")
 
-        df.to_excel(writer, index=False, sheet_name="Raw_Billing_Enriched")
+        df_x.to_excel(writer, index=False, sheet_name="Raw_Billing_Enriched")
 
     st.download_button(
         "Download Report Excel",
