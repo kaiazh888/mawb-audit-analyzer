@@ -62,16 +62,13 @@ def clean_eta_series(s: pd.Series) -> pd.Series:
         dt2 = pd.to_datetime(s2[mask], errors="coerce", dayfirst=True, infer_datetime_format=True)
         dt1.loc[mask] = dt2
 
-    # keep DATE only
+    # DATE only
     dt1 = dt1.dt.normalize()
     return dt1
 
 def pct(numer: pd.Series, denom: pd.Series) -> pd.Series:
+    # returns ratio 0..1
     return (numer / denom).where(denom != 0, 0)
-
-def pct_percent(numer: pd.Series, denom: pd.Series) -> pd.Series:
-    """✅ Profit Margin as percent number (0-100)"""
-    return pct(numer, denom) * 100
 
 def normalize_mawb(x: str) -> str:
     if x is None:
@@ -82,14 +79,17 @@ def normalize_mawb(x: str) -> str:
 
     s_alnum = re.sub(r"[^0-9A-Z]", "", s)
 
+    # digits 11 => 3+8
     if s_alnum.isdigit() and len(s_alnum) == 11:
         return f"{s_alnum[:3]}-{s_alnum[3:]}"
+    # digits 12 => last 11
     if s_alnum.isdigit() and len(s_alnum) == 12:
         s11 = s_alnum[-11:]
         if len(s11) == 11:
             return f"{s11[:3]}-{s11[3:]}"
         return s_alnum
 
+    # keep existing hyphen format if already 3-xxxx
     if "-" in s and len(s.split("-")[0]) == 3:
         return s
 
@@ -110,9 +110,41 @@ def to_date_only(df_in: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
             df_out[c] = pd.to_datetime(df_out[c], errors="coerce").dt.date
     return df_out
 
-def make_kpi_vertical(kpi_dict: dict) -> pd.DataFrame:
-    """✅ KPI two-column vertical layout"""
-    return pd.DataFrame({"Metric": list(kpi_dict.keys()), "Value": list(kpi_dict.values())})
+def format_pct_str(x):
+    try:
+        return f"{float(x) * 100:.2f}%"
+    except Exception:
+        return ""
+
+def add_pct_display(df_in: pd.DataFrame, pct_cols: list[str]) -> pd.DataFrame:
+    """
+    Streamlit display helper: add a string % column for each pct col and drop the raw if you want.
+    Keeps raw pct columns too (for sorting if needed).
+    """
+    df_out = df_in.copy()
+    for c in pct_cols:
+        if c in df_out.columns:
+            disp = c  # keep same name for display? We'll add a new one to avoid confusion
+            df_out[disp] = df_out[c].apply(format_pct_str)
+    return df_out
+
+def make_kpi_vertical(kpi_dict: dict, pct_keys: set[str]) -> pd.DataFrame:
+    rows = []
+    for k, v in kpi_dict.items():
+        if k in pct_keys:
+            rows.append({"Metric": k, "Value": format_pct_str(v)})
+        else:
+            rows.append({"Metric": k, "Value": v})
+    return pd.DataFrame(rows)
+
+# Excel formatting helpers
+def excel_set_percent_col(ws, col_idx: int, workbook, width: int = 16):
+    fmt = workbook.add_format({"num_format": "0.00%"})
+    ws.set_column(col_idx, col_idx, width, fmt)
+
+def excel_set_currency_col(ws, col_idx: int, workbook, width: int = 16):
+    fmt = workbook.add_format({"num_format": "#,##0.00"})
+    ws.set_column(col_idx, col_idx, width, fmt)
 
 # ---------------- Uploaders ----------------
 billing_file = st.file_uploader("Upload Billing Charges Excel (.xlsx)", type=["xlsx"], key="billing")
@@ -153,6 +185,8 @@ if not billing_file:
     st.stop()
 
 try:
+    MARGIN_LABEL = "Margin<30% or >80%"
+
     # ---- Read billing charges ----
     xls = pd.ExcelFile(billing_file)
     billing_sheet = find_sheet_with_required_cols(xls, BILLING_REQUIRED)
@@ -273,22 +307,19 @@ try:
     summary["ETA Month"] = summary["ETA"].dt.to_period("M").astype(str).replace("NaT", "")
 
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
-    # ✅ 3) Profit margin as percent (0-100)
-    summary["Profit Margin %"] = pct_percent(summary["Profit"], summary["Total_Sell"])
+    # Profit margin as ratio 0..1 (Excel/Streamlit will show % with symbol)
+    summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
-    # ✅ Closed rule uses 30~80 (percent scale now)
+    # ✅ Rule: if PM <30% or >80% => Open
     def is_closed(r):
         if not (r["Total_Cost"] > 0 and r["Total_Sell"] > 0):
             return "Open"
         pm = r["Profit Margin %"]
-        if (pm < 30) or (pm > 80):
+        if (pm < 0.30) or (pm > 0.80):
             return "Open"
         return "Closed"
 
     summary["Classification"] = summary.apply(is_closed, axis=1)
-
-    # ✅ 4) Rename exception label
-    MARGIN_LABEL = "Margin<30% or >80%"
 
     def exception_type(r):
         if r["Total_Cost"] == 0 and r["Total_Sell"] == 0:
@@ -299,7 +330,7 @@ try:
             return "Cost=0"
 
         pm = r["Profit Margin %"]
-        if (pm != 0) and ((pm < 30) or (pm > 80)):
+        if (pm != 0) and ((pm < 0.30) or (pm > 0.80)):
             return MARGIN_LABEL
         return ""
 
@@ -318,12 +349,12 @@ try:
           )
     )
     client_summary["Profit"] = client_summary["Total_Sell"] - client_summary["Total_Cost"]
-    client_summary["Profit Margin %"] = pct_percent(client_summary["Profit"], client_summary["Total_Sell"])
+    client_summary["Profit Margin %"] = pct(client_summary["Profit"], client_summary["Total_Sell"])
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
     # ---- Margin Outliers / Negative Profit ----
     margin_outliers = summary[
-        ((summary["Profit Margin %"] < 30) | (summary["Profit Margin %"] > 80)) &
+        ((summary["Profit Margin %"] < 0.30) | (summary["Profit Margin %"] > 0.80)) &
         (summary["Profit Margin %"] != 0)
     ].copy().sort_values("Profit Margin %")
 
@@ -333,12 +364,12 @@ try:
     zero_margin = summary[summary["Profit Margin %"] == 0].copy().sort_values(["Total_Sell", "Total_Cost"], ascending=False)
     zero_profit = summary[summary["Profit"] == 0].copy().sort_values(["Total_Sell", "Total_Cost"], ascending=False)
 
-    # ✅ 2) Keep ONLY zero_only tabs + Both_Zero; remove non-zero-only Sell_Zero/Cost_Zero
+    # ---- Keep only zero_only tabs + Cost=Sell=0 ----
     both_zero = summary[(summary["Total_Sell"] == 0) & (summary["Total_Cost"] == 0)].copy().sort_values("MAWB")
     sell_zero_only = summary[(summary["Total_Sell"] == 0) & (summary["Total_Cost"] > 0)].copy().sort_values("Total_Cost", ascending=False)
     cost_zero_only = summary[(summary["Total_Cost"] == 0) & (summary["Total_Sell"] > 0)].copy().sort_values("Total_Sell", ascending=False)
 
-    # ---- D: Charge Code Summary ----
+    # ---- Charge Code Summary ----
     chargecode_summary = (
         df.groupby("Charge Code", as_index=False)
           .agg(
@@ -349,9 +380,10 @@ try:
           )
     )
     chargecode_summary["Profit"] = chargecode_summary["Total_Sell"] - chargecode_summary["Total_Cost"]
-    chargecode_summary["Profit Margin %"] = pct_percent(chargecode_summary["Profit"], chargecode_summary["Total_Sell"])
+    chargecode_summary["Profit Margin %"] = pct(chargecode_summary["Profit"], chargecode_summary["Total_Sell"])
     chargecode_summary = chargecode_summary.sort_values("Profit", ascending=False)
 
+    # Charge code exception counts (MAWB-level flags)
     mawb_flags = summary[["MAWB", "Exception_Type"]].copy()
     mawb_charge = df[["MAWB", "Charge Code"]].drop_duplicates()
     cc_exc = mawb_charge.merge(mawb_flags, on="MAWB", how="left")
@@ -366,7 +398,7 @@ try:
     )
     chargecode_summary = chargecode_summary.merge(chargecode_exceptions, on="Charge Code", how="left").fillna(0)
 
-    # ---- D: Vendor Summary ----
+    # ---- Vendor Summary ----
     vendor_summary = (
         df.groupby("Vendor", as_index=False)
           .agg(
@@ -377,7 +409,7 @@ try:
           )
     )
     vendor_summary["Profit"] = vendor_summary["Total_Sell"] - vendor_summary["Total_Cost"]
-    vendor_summary["Profit Margin %"] = pct_percent(vendor_summary["Profit"], vendor_summary["Total_Sell"])
+    vendor_summary["Profit Margin %"] = pct(vendor_summary["Profit"], vendor_summary["Total_Sell"])
     vendor_summary = vendor_summary.sort_values("Profit", ascending=False)
 
     mawb_vendor = df[["MAWB", "Vendor"]].drop_duplicates()
@@ -393,7 +425,7 @@ try:
     )
     vendor_summary = vendor_summary.merge(vendor_exceptions, on="Vendor", how="left").fillna(0)
 
-    # ---- NEW: Charge Code Profit <= 0 by MAWB ----
+    # ---- Charge Code Profit <= 0 by MAWB ----
     cc_mawb = (
         df.groupby(["MAWB", "Charge Code"], as_index=False)
           .agg(
@@ -405,7 +437,7 @@ try:
           )
     )
     cc_mawb["Profit"] = cc_mawb["Total_Sell"] - cc_mawb["Total_Cost"]
-    cc_mawb["Profit Margin %"] = pct_percent(cc_mawb["Profit"], cc_mawb["Total_Sell"])
+    cc_mawb["Profit Margin %"] = pct(cc_mawb["Profit"], cc_mawb["Total_Sell"])
     cc_mawb["ETA Month"] = pd.to_datetime(cc_mawb["ETA"], errors="coerce").dt.to_period("M").astype(str).replace("NaT", "")
 
     chargecode_profit_le0_mawb = cc_mawb[cc_mawb["Profit"] <= 0].copy().sort_values(
@@ -419,11 +451,13 @@ try:
 
     total_sell_sum = float(summary["Total_Sell"].sum())
     total_profit_sum = float(summary["Profit"].sum())
+    overall_pm = (total_profit_sum / total_sell_sum) if total_sell_sum else 0
 
-    # ✅ 5) negative profit count/amount/ratio
     neg_profit_cnt = int((summary["Profit"] < 0).sum())
     neg_profit_amt = float(summary.loc[summary["Profit"] < 0, "Profit"].sum())
     neg_profit_ratio = (neg_profit_cnt / total_mawb) if total_mawb else 0
+
+    eta_filled_ratio = float((summary["ETA"].notna().sum() / total_mawb)) if total_mawb else 0
 
     kpi_dict = {
         "Total MAWB": total_mawb,
@@ -437,22 +471,17 @@ try:
         "Total Cost": float(summary["Total_Cost"].sum()),
         "Total Sell": total_sell_sum,
         "Total Profit": total_profit_sum,
-        # profit margin overall in % units
-        "Overall Profit Margin %": (total_profit_sum / total_sell_sum * 100) if total_sell_sum else 0,
-        "ETA Filled %": float((summary["ETA"].notna().sum() / total_mawb)) if total_mawb else 0,
+        "Overall Profit Margin %": overall_pm,
+        "ETA Filled %": eta_filled_ratio,
     }
-    kpi_vertical = make_kpi_vertical(kpi_dict)
+    KPI_PCT_KEYS = {"Closed %", "Overall Profit Margin %", "ETA Filled %"}
+    kpi_vertical = make_kpi_vertical(kpi_dict, KPI_PCT_KEYS)
 
-    neg_summary = pd.DataFrame([{
-        "Metric": "Profit < 0 Count",
-        "Value": neg_profit_cnt
-    }, {
-        "Metric": "Profit < 0 Total Amount",
-        "Value": neg_profit_amt
-    }, {
-        "Metric": "Profit < 0 % of MAWBs",
-        "Value": neg_profit_ratio
-    }])
+    neg_summary = pd.DataFrame([
+        {"Metric": "Profit < 0 Count", "Value": neg_profit_cnt},
+        {"Metric": "Profit < 0 Total Amount", "Value": neg_profit_amt},
+        {"Metric": "Profit < 0 % of MAWBs", "Value": format_pct_str(neg_profit_ratio)},
+    ])
 
     # ---------------- UI ----------------
     if eta_parse_note:
@@ -468,45 +497,59 @@ try:
     st.subheader("Summary: Profit < 0 (Count / Amount / Ratio)")
     st.dataframe(neg_summary, use_container_width=True)
 
+    # Streamlit display: show % with symbol by converting to string columns
+    def display_df(df_in, date_cols=None):
+        out = df_in.copy()
+        if date_cols:
+            out = to_date_only(out, date_cols)
+        if "Profit Margin %" in out.columns:
+            out["Profit Margin %"] = out["Profit Margin %"].apply(format_pct_str)
+        if "Closed %" in out.columns:
+            out["Closed %"] = out["Closed %"].apply(format_pct_str)
+        if "ETA Filled %" in out.columns:
+            out["ETA Filled %"] = out["ETA Filled %"].apply(format_pct_str)
+        if "Overall Profit Margin %" in out.columns:
+            out["Overall Profit Margin %"] = out["Overall Profit Margin %"].apply(format_pct_str)
+        return out
+
     st.subheader("Exceptions (Open items)")
-    st.dataframe(to_date_only(exceptions, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(exceptions, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("MAWB Summary (All)")
-    st.dataframe(to_date_only(summary, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(summary, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Client Profit Summary")
-    st.dataframe(to_date_only(client_summary, ["Latest_ETA"]), use_container_width=True)
+    st.dataframe(display_df(client_summary, date_cols=["Latest_ETA"]), use_container_width=True)
 
     st.subheader(f"Profit Margin Outliers ({MARGIN_LABEL}, PM!=0)")
-    st.dataframe(to_date_only(margin_outliers, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(margin_outliers, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Negative Profit (Profit < 0)")
-    st.dataframe(to_date_only(negative_profit, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(negative_profit, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Zero Margin (Profit Margin % = 0)")
-    st.dataframe(to_date_only(zero_margin, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(zero_margin, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Zero Profit (Profit = 0)")
-    st.dataframe(to_date_only(zero_profit, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(zero_profit, date_cols=["ETA"]), use_container_width=True)
 
-    # ✅ 2) only keep both_zero + zero_only tabs
-    st.subheader("Both Zero (Cost=Sell=0)")
-    st.dataframe(to_date_only(both_zero, ["ETA"]), use_container_width=True)
+    st.subheader("Cost=Sell=0 (Both Zero)")
+    st.dataframe(display_df(both_zero, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Sell=0 ONLY (Total_Sell=0 and Total_Cost>0)")
-    st.dataframe(to_date_only(sell_zero_only, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(sell_zero_only, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Cost=0 ONLY (Total_Cost=0 and Total_Sell>0)")
-    st.dataframe(to_date_only(cost_zero_only, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(cost_zero_only, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Charge Code Summary (D)")
-    st.dataframe(chargecode_summary, use_container_width=True)
+    st.dataframe(display_df(chargecode_summary), use_container_width=True)
 
     st.subheader("Vendor Summary (D)")
-    st.dataframe(vendor_summary, use_container_width=True)
+    st.dataframe(display_df(vendor_summary), use_container_width=True)
 
     st.subheader("Charge Code Profit <= 0 (by MAWB)")
-    st.dataframe(to_date_only(chargecode_profit_le0_mawb, ["ETA"]), use_container_width=True)
+    st.dataframe(display_df(chargecode_profit_le0_mawb, date_cols=["ETA"]), use_container_width=True)
 
     # ---------------- Export ----------------
     output = io.BytesIO()
@@ -527,25 +570,22 @@ try:
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         workbook = writer.book
-
-        # ✅ 5) Analysis Summary sheet (manual layout + hyperlinks + embedded tables)
-        ws = workbook.add_worksheet("Analysis Summary")
-        writer.sheets["Analysis Summary"] = ws
-
         header_fmt = workbook.add_format({"bold": True, "font_size": 14})
         subheader_fmt = workbook.add_format({"bold": True, "font_size": 12})
         bold_fmt = workbook.add_format({"bold": True})
         percent_fmt = workbook.add_format({"num_format": "0.00%"})
-        percent_num_fmt = workbook.add_format({"num_format": "0.00"})  # for % values already 0-100
+        number_fmt = workbook.add_format({"num_format": "#,##0.00"})
 
-        # Top header
+        # ✅ Analysis Summary sheet (manual layout + hyperlinks + embedded tables)
+        ws = workbook.add_worksheet("Analysis Summary")
+        writer.sheets["Analysis Summary"] = ws
+
         ws.write(0, 0, "Analysis Summary", header_fmt)
 
-        # ✅ Hyperlinks section: "用途 + detail（超链接）"
+        # Hyperlinks: “用途 + detail（超链接）”
         link_start_row = 2
         ws.write(link_start_row, 0, "This page provides an overview. Click detail links below:", bold_fmt)
 
-        # list of sheets to link (will be created below)
         tab_links = [
             ("Open exceptions overview + detail", "Exceptions"),
             ("MAWB level summary + detail", "MAWB_Summary"),
@@ -567,48 +607,40 @@ try:
 
         r = link_start_row + 1
         for text, sheet_name in tab_links:
-            # link format: internal: 'Sheet Name'!A1
             ws.write_url(r, 0, f"internal:'{sheet_name}'!A1", string=text)
             r += 1
 
-        # ✅ KPI vertical (two columns)
+        # KPI vertical (two columns)
         kpi_row = r + 1
         ws.write(kpi_row, 0, "KPI (two-column)", subheader_fmt)
-        # write headers
         ws.write(kpi_row + 1, 0, "Metric", bold_fmt)
         ws.write(kpi_row + 1, 1, "Value", bold_fmt)
 
-        # write KPI rows
-        for i, row in enumerate(kpi_vertical.itertuples(index=False), start=0):
-            ws.write(kpi_row + 2 + i, 0, row.Metric)
-            val = row.Value
-            # format percentages in KPI that are ratios
-            if row.Metric in {"Closed %", "ETA Filled %"} or row.Metric.endswith("% of MAWBs"):
-                # these are 0-1
-                ws.write_number(kpi_row + 2 + i, 1, float(val), percent_fmt)
-            elif row.Metric in {"Overall Profit Margin %"}:
-                # already 0-100
-                ws.write_number(kpi_row + 2 + i, 1, float(val), percent_num_fmt)
+        # Write KPI values (keep % as numeric formatted with % sign)
+        kpi_write_row = kpi_row + 2
+        for i, (k, v) in enumerate(kpi_dict.items()):
+            ws.write(kpi_write_row + i, 0, k)
+            if k in KPI_PCT_KEYS:
+                ws.write_number(kpi_write_row + i, 1, float(v), percent_fmt)
             else:
-                # normal number
                 try:
-                    ws.write_number(kpi_row + 2 + i, 1, float(val))
+                    ws.write_number(kpi_write_row + i, 1, float(v), number_fmt)
                 except Exception:
-                    ws.write(kpi_row + 2 + i, 1, str(val))
+                    ws.write(kpi_write_row + i, 1, str(v))
 
-        # ✅ Negative profit summary table in same sheet
-        neg_row = kpi_row + 2 + len(kpi_vertical) + 2
+        # Negative profit summary
+        neg_row = kpi_write_row + len(kpi_dict) + 2
         ws.write(neg_row, 0, "Summary: Profit < 0", subheader_fmt)
         ws.write(neg_row + 1, 0, "Metric", bold_fmt)
         ws.write(neg_row + 1, 1, "Value", bold_fmt)
         ws.write(neg_row + 2, 0, "Profit < 0 Count")
-        ws.write_number(neg_row + 2, 1, float(neg_profit_cnt))
+        ws.write_number(neg_row + 2, 1, float(neg_profit_cnt), number_fmt)
         ws.write(neg_row + 3, 0, "Profit < 0 Total Amount")
-        ws.write_number(neg_row + 3, 1, float(neg_profit_amt))
+        ws.write_number(neg_row + 3, 1, float(neg_profit_amt), number_fmt)
         ws.write(neg_row + 4, 0, "Profit < 0 % of MAWBs")
         ws.write_number(neg_row + 4, 1, float(neg_profit_ratio), percent_fmt)
 
-        # ✅ Put ChargeCode_Summary and Vendor_Summary into same Analysis Summary sheet
+        # Embed ChargeCode_Summary and Vendor_Summary in Analysis Summary
         cc_row = neg_row + 6
         ws.write(cc_row, 0, "ChargeCode_Summary (embedded)", subheader_fmt)
         chargecode_summary.to_excel(writer, index=False, sheet_name="Analysis Summary", startrow=cc_row + 1, startcol=0)
@@ -616,6 +648,14 @@ try:
         v_row = cc_row + 2 + len(chargecode_summary) + 3
         ws.write(v_row, 0, "Vendor_Summary (embedded)", subheader_fmt)
         vendor_summary.to_excel(writer, index=False, sheet_name="Analysis Summary", startrow=v_row + 1, startcol=0)
+
+        # Apply percent format to Profit Margin % column in embedded area (whole column)
+        # Find column index for "Profit Margin %"
+        try:
+            pm_col_idx_cc = list(chargecode_summary.columns).index("Profit Margin %")
+            excel_set_percent_col(ws, pm_col_idx_cc, workbook)
+        except Exception:
+            pass
 
         # ---- Other sheets ----
         exceptions_x.to_excel(writer, index=False, sheet_name="Exceptions")
@@ -628,20 +668,44 @@ try:
         zero_margin_x.to_excel(writer, index=False, sheet_name="Zero_Margin")
         zero_profit_x.to_excel(writer, index=False, sheet_name="Zero_Profit")
 
-        # ✅ 2) Only keep Both_Zero + zero_only
         both_zero_x.to_excel(writer, index=False, sheet_name="Both_Zero")
         sell_zero_only_x.to_excel(writer, index=False, sheet_name="Sell_Zero_Only")
         cost_zero_only_x.to_excel(writer, index=False, sheet_name="Cost_Zero_Only")
 
         chargecode_summary.to_excel(writer, index=False, sheet_name="ChargeCode_Summary")
         vendor_summary.to_excel(writer, index=False, sheet_name="Vendor_Summary")
-
         chargecode_profit_le0_mawb_x.to_excel(writer, index=False, sheet_name="ChargeCode_ProfitLE0_MAWB")
 
         if mawb_keep:
             pd.DataFrame({"MAWB": mawb_not_found}).to_excel(writer, index=False, sheet_name="MAWB_Not_Found")
 
         df_x.to_excel(writer, index=False, sheet_name="Raw_Billing_Enriched")
+
+        # ---- Format % columns to show % symbol in ALL sheets ----
+        percent_sheets = {
+            "Exceptions": exceptions_x,
+            "MAWB_Summary": summary_x,
+            "Client_Summary": client_summary_x,
+            "Margin_Outliers": margin_outliers_x,
+            "Negative_Profit": negative_profit_x,
+            "Zero_Margin": zero_margin_x,
+            "Zero_Profit": zero_profit_x,
+            "Both_Zero": both_zero_x,
+            "Sell_Zero_Only": sell_zero_only_x,
+            "Cost_Zero_Only": cost_zero_only_x,
+            "ChargeCode_Summary": chargecode_summary,
+            "Vendor_Summary": vendor_summary,
+            "ChargeCode_ProfitLE0_MAWB": chargecode_profit_le0_mawb_x,
+        }
+
+        for sh, dfx in percent_sheets.items():
+            if sh in writer.sheets and "Profit Margin %" in dfx.columns:
+                ws2 = writer.sheets[sh]
+                pm_col = list(dfx.columns).index("Profit Margin %")
+                excel_set_percent_col(ws2, pm_col, workbook)
+
+        # Also format percent-like columns in MAWB_Summary if needed (none besides Profit Margin %)
+        # Optionally format KPI-like columns are handled on Analysis Summary already.
 
     st.download_button(
         "Download Report Excel",
