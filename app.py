@@ -172,6 +172,8 @@ BILLING_OPTIONAL = {
     "Client": ["Client", "Customer", "Account", "Shipper", "Bill To", "Billed To"],
     "Charge Code": ["Charge Code", "ChargeCode", "Charge", "Code"],
     "Vendor": ["Vendor", "Carrier", "Supplier"],
+    # Added: station/airport column candidates
+    "Station": ["Station", "Airport", "POL", "POD", "Origin", "Destination", "Location", "Port"],
 }
 
 ETA_REQUIRED = {
@@ -185,7 +187,15 @@ if not billing_file:
     st.stop()
 
 try:
-    MARGIN_LABEL = "Margin<30% or >80%"
+    # ✅ Split labels (instead of combined label)
+    LOW_MARGIN_LABEL = "Margin<30%"
+    HIGH_MARGIN_LABEL = "Margin>80%"
+
+    # ✅ Special “high margin is normal/closable” rules
+    SPECIAL_HIGH_MARGIN_CLOSE = {
+        "4PXDIGHKG": {"MIA", "ORD", "LAX"},
+        "HANCAIWUX": {"MIA", "ORD"},
+    }
 
     # ---- Read billing charges ----
     xls = pd.ExcelFile(billing_file)
@@ -206,6 +216,7 @@ try:
     client_col = find_first_col(raw_df, BILLING_OPTIONAL["Client"])
     charge_code_col = find_first_col(raw_df, BILLING_OPTIONAL["Charge Code"])
     vendor_col = find_first_col(raw_df, BILLING_OPTIONAL["Vendor"])
+    station_col = find_first_col(raw_df, BILLING_OPTIONAL["Station"])  # ✅ new (optional)
 
     if not (mawb_col and cost_col and sell_col):
         st.error("Billing sheet found but required columns could not be detected after scanning.")
@@ -225,6 +236,15 @@ try:
 
     df["Vendor"] = df[vendor_col].astype(str).str.strip() if vendor_col else "UNKNOWN"
     df.loc[df["Vendor"].isin(["", "nan", "None"]), "Vendor"] = "UNKNOWN"
+
+    # ✅ station field (optional; normalize to upper 3-letter if possible)
+    if station_col:
+        df["Station"] = df[station_col].astype(str).str.strip().str.upper()
+        df.loc[df["Station"].isin(["", "NAN", "NONE"]), "Station"] = ""
+        # keep alnum only (handles "MIA - xx", etc)
+        df["Station"] = df["Station"].str.extract(r"([A-Z]{3})", expand=False).fillna(df["Station"])
+    else:
+        df["Station"] = ""
 
     df = df[df["MAWB"].ne("")].copy()
 
@@ -298,6 +318,7 @@ try:
         df.groupby("MAWB", as_index=False)
           .agg(
               Client=("Client", "first"),
+              Station=("Station", "first"),  # ✅ keep station at MAWB-level
               Total_Cost=("Cost Amount", "sum"),
               Total_Sell=("Sell Amount", "sum"),
               Line_Count=("MAWB", "size"),
@@ -307,16 +328,38 @@ try:
     summary["ETA Month"] = summary["ETA"].dt.to_period("M").astype(str).replace("NaT", "")
 
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
-    # Profit margin as ratio 0..1 (Excel/Streamlit will show % with symbol)
+    # Profit margin as ratio 0..1
     summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
-    # ✅ Rule: if PM <30% or >80% => Open
+    def is_special_high_margin_normal(client: str, station: str) -> bool:
+        """
+        Returns True if (client, station) is an allowed combination where margin>80% is normal/closable.
+        """
+        c = (client or "").strip().upper()
+        s = (station or "").strip().upper()
+        if not c or not s:
+            return False
+        allowed = SPECIAL_HIGH_MARGIN_CLOSE.get(c)
+        return bool(allowed and (s in allowed))
+
+    # ✅ Rule: split margin exceptions; high-margin may be closable for specific client+station
     def is_closed(r):
         if not (r["Total_Cost"] > 0 and r["Total_Sell"] > 0):
             return "Open"
+
         pm = r["Profit Margin %"]
-        if (pm < 0.30) or (pm > 0.80):
+
+        # Low margin always abnormal => Open
+        if pm < 0.30:
             return "Open"
+
+        # High margin: normal for special combos => Closed, otherwise Open
+        if pm > 0.80:
+            if is_special_high_margin_normal(r.get("Client", ""), r.get("Station", "")):
+                return "Closed"
+            return "Open"
+
+        # Normal range
         return "Closed"
 
     summary["Classification"] = summary.apply(is_closed, axis=1)
@@ -330,8 +373,17 @@ try:
             return "Cost=0"
 
         pm = r["Profit Margin %"]
-        if (pm != 0) and ((pm < 0.30) or (pm > 0.80)):
-            return MARGIN_LABEL
+
+        # Split labels (instead of one combined label)
+        if pm < 0.30 and pm != 0:
+            return LOW_MARGIN_LABEL
+
+        if pm > 0.80 and pm != 0:
+            # Special case: treat as normal/closable => no exception label
+            if is_special_high_margin_normal(r.get("Client", ""), r.get("Station", "")):
+                return ""
+            return HIGH_MARGIN_LABEL
+
         return ""
 
     summary["Exception_Type"] = summary.apply(exception_type, axis=1)
@@ -353,9 +405,18 @@ try:
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
     # ---- Margin Outliers / Negative Profit ----
+    # ✅ Outliers now exclude special high-margin normal cases
+    special_mawbs = summary[
+        (summary["Profit Margin %"] > 0.80) &
+        summary.apply(lambda r: is_special_high_margin_normal(r.get("Client", ""), r.get("Station", "")), axis=1)
+    ]["MAWB"].unique().tolist()
+
     margin_outliers = summary[
-        ((summary["Profit Margin %"] < 0.30) | (summary["Profit Margin %"] > 0.80)) &
-        (summary["Profit Margin %"] != 0)
+        (
+            ((summary["Profit Margin %"] < 0.30) | (summary["Profit Margin %"] > 0.80)) &
+            (summary["Profit Margin %"] != 0)
+        ) &
+        (~summary["MAWB"].isin(special_mawbs))
     ].copy().sort_values("Profit Margin %")
 
     negative_profit = summary[summary["Profit"] < 0].copy().sort_values("Profit")
@@ -430,6 +491,7 @@ try:
         df.groupby(["MAWB", "Charge Code"], as_index=False)
           .agg(
               Client=("Client", "first"),
+              Station=("Station", "first"),
               Vendor=("Vendor", "first"),
               Total_Cost=("Cost Amount", "sum"),
               Total_Sell=("Sell Amount", "sum"),
@@ -467,7 +529,8 @@ try:
         "Revenue=0 Count": int((summary["Exception_Type"] == "Revenue=0").sum()),
         "Cost=0 Count": int((summary["Exception_Type"] == "Cost=0").sum()),
         "Cost=Sell=0 Count": int((summary["Exception_Type"] == "Cost=Sell=0").sum()),
-        f"{MARGIN_LABEL} Count": int((summary["Exception_Type"] == MARGIN_LABEL).sum()),
+        f"{LOW_MARGIN_LABEL} Count": int((summary["Exception_Type"] == LOW_MARGIN_LABEL).sum()),
+        f"{HIGH_MARGIN_LABEL} Count": int((summary["Exception_Type"] == HIGH_MARGIN_LABEL).sum()),
         "Total Cost": float(summary["Total_Cost"].sum()),
         "Total Sell": total_sell_sum,
         "Total Profit": total_profit_sum,
@@ -521,7 +584,7 @@ try:
     st.subheader("Client Profit Summary")
     st.dataframe(display_df(client_summary, date_cols=["Latest_ETA"]), use_container_width=True)
 
-    st.subheader(f"Profit Margin Outliers ({MARGIN_LABEL}, PM!=0)")
+    st.subheader(f"Profit Margin Outliers ({LOW_MARGIN_LABEL} / {HIGH_MARGIN_LABEL}, PM!=0)")
     st.dataframe(display_df(margin_outliers, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Negative Profit (Profit < 0)")
@@ -590,7 +653,7 @@ try:
             ("Open exceptions overview + detail", "Exceptions"),
             ("MAWB level summary + detail", "MAWB_Summary"),
             ("Client margin summary + detail", "Client_Summary"),
-            (f"Margin anomalies ({MARGIN_LABEL}) + detail", "Margin_Outliers"),
+            (f"Margin anomalies ({LOW_MARGIN_LABEL} / {HIGH_MARGIN_LABEL}) + detail", "Margin_Outliers"),
             ("Negative profit MAWBs + detail", "Negative_Profit"),
             ("Zero margin tickets + detail", "Zero_Margin"),
             ("Zero profit tickets + detail", "Zero_Profit"),
@@ -649,14 +712,6 @@ try:
         ws.write(v_row, 0, "Vendor_Summary (embedded)", subheader_fmt)
         vendor_summary.to_excel(writer, index=False, sheet_name="Analysis Summary", startrow=v_row + 1, startcol=0)
 
-        # Apply percent format to Profit Margin % column in embedded area (whole column)
-        # Find column index for "Profit Margin %"
-        try:
-            pm_col_idx_cc = list(chargecode_summary.columns).index("Profit Margin %")
-            excel_set_percent_col(ws, pm_col_idx_cc, workbook)
-        except Exception:
-            pass
-
         # ---- Other sheets ----
         exceptions_x.to_excel(writer, index=False, sheet_name="Exceptions")
         summary_x.to_excel(writer, index=False, sheet_name="MAWB_Summary")
@@ -703,9 +758,6 @@ try:
                 ws2 = writer.sheets[sh]
                 pm_col = list(dfx.columns).index("Profit Margin %")
                 excel_set_percent_col(ws2, pm_col, workbook)
-
-        # Also format percent-like columns in MAWB_Summary if needed (none besides Profit Margin %)
-        # Optionally format KPI-like columns are handled on Analysis Summary already.
 
     st.download_button(
         "Download Report Excel",
