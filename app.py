@@ -1,5 +1,6 @@
 import io
 import re
+import numpy as np
 import pandas as pd
 import streamlit as st
 
@@ -110,18 +111,23 @@ def to_date_only(df_in: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
 def format_pct_str_or_blank(x):
     """x is ratio (0..1). Return blank for NaN/NA."""
     try:
-        if x is None or x is pd.NA or pd.isna(x):
+        if x is None or pd.isna(x):
             return ""
         return f"{float(x) * 100:.2f}%"
     except Exception:
         return ""
 
 def ratio_or_nan(numer: pd.Series, denom: pd.Series) -> pd.Series:
-    """Return numer/denom, but NaN when denom==0 (so margin displays blank)."""
-    denom0 = denom.fillna(0)
-    out = pd.Series([pd.NA] * len(denom0), index=denom0.index, dtype="float64")
-    mask = denom0 != 0
-    out.loc[mask] = (numer.loc[mask] / denom0.loc[mask]).astype("float64")
+    """
+    Return numer/denom as float series.
+    If denom==0 => np.nan (so margin displays blank; avoids pd.NA float casting issues).
+    """
+    numer = pd.to_numeric(numer, errors="coerce")
+    denom = pd.to_numeric(denom, errors="coerce").fillna(0)
+
+    out = pd.Series(np.nan, index=denom.index, dtype="float64")
+    mask = denom != 0
+    out.loc[mask] = (numer.loc[mask] / denom.loc[mask]).astype("float64")
     return out
 
 # ---- Robust NA handling to prevent float(pd.NA) crashes ----
@@ -309,7 +315,7 @@ try:
         s_cost = float(structural_df["Cost Amount"].sum())
         s_sell = float(structural_df["Sell Amount"].sum())
         s_profit = s_sell - s_cost
-        s_margin = (s_profit / s_sell) if s_sell else None  # show blank when AR=0
+        s_margin = (s_profit / s_sell) if s_sell else None
         structural_totals = {
             "Client": "PROCARESX",
             "MAWB Count": int(structural_df["MAWB"].nunique()),
@@ -340,7 +346,6 @@ try:
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
     summary["Profit Margin %"] = ratio_or_nan(summary["Profit"], summary["Total_Sell"])
 
-    # Classification & Exception Types (auditable only)
     def classification(r):
         if not (r["Total_Cost"] > 0 and r["Total_Sell"] > 0):
             return "Open"
@@ -368,10 +373,9 @@ try:
 
     summary["Classification"] = summary.apply(classification, axis=1)
     summary["Exception_Type"] = summary.apply(exception_type, axis=1)
-
     exceptions = summary[summary["Classification"].eq("Open")].copy()
 
-    # ---- Client Summary (auditable clients only) ----
+    # ---- Client Summary ----
     client_summary = (
         df.groupby("Client", as_index=False)
           .agg(
@@ -386,7 +390,7 @@ try:
     client_summary["Profit Margin %"] = ratio_or_nan(client_summary["Profit"], client_summary["Total_Sell"])
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
-    # ---- Margin Anomalies / Negative Profit ----
+    # ---- Margin anomalies / Negative profit ----
     margin_anomalies = summary[
         ((summary["Profit Margin %"] < 0.30) | (summary["Profit Margin %"] > 0.80)) &
         (~summary["Profit Margin %"].isna())
@@ -413,7 +417,6 @@ try:
     chargecode_summary["Profit Margin %"] = ratio_or_nan(chargecode_summary["Profit"], chargecode_summary["Total_Sell"])
     chargecode_summary = chargecode_summary.sort_values("Profit", ascending=False)
 
-    # Charge code exception counts (MAWB-level flags)
     mawb_flags = summary[["MAWB", "Exception_Type"]].copy()
     mawb_charge = df[["MAWB", "Charge Code"]].drop_duplicates()
     cc_exc = mawb_charge.merge(mawb_flags, on="MAWB", how="left")
@@ -475,7 +478,7 @@ try:
     )
 
     # =========================
-    # KPI (Auditable only) + Structural Totals block
+    # KPI (Auditable only)
     # =========================
     total_mawb = int(len(summary))
     closed_cnt = int((summary["Classification"] == "Closed").sum())
@@ -484,7 +487,7 @@ try:
     total_sell_sum = float(summary["Total_Sell"].sum())
     total_cost_sum = float(summary["Total_Cost"].sum())
     total_profit_sum = float(summary["Profit"].sum())
-    overall_pm = (total_profit_sum / total_sell_sum) if total_sell_sum else None  # blank if AR=0
+    overall_pm = (total_profit_sum / total_sell_sum) if total_sell_sum else np.nan
 
     neg_profit_cnt = int((summary["Profit"] < 0).sum())
     neg_profit_amt = float(summary.loc[summary["Profit"] < 0, "Profit"].sum())
@@ -518,13 +521,11 @@ try:
         st.subheader("MAWB Not Found (in uploaded Billing file)")
         st.dataframe(pd.DataFrame({"MAWB": mawb_not_found}), use_container_width=True)
 
-    # Structural totals block (PROCARESX only totals)
     if structural_totals:
         st.subheader("Structural Client Totals (Excluded from ALL Audit Details)")
         tmp = pd.DataFrame([structural_totals])
-        tmp_display = tmp.copy()
-        tmp_display["Profit Margin %"] = tmp_display["Profit Margin %"].apply(format_pct_str_or_blank)
-        st.dataframe(tmp_display, use_container_width=True)
+        tmp["Profit Margin %"] = tmp["Profit Margin %"].apply(format_pct_str_or_blank)
+        st.dataframe(tmp, use_container_width=True)
 
     st.subheader("Analysis Summary (KPI) — Auditable Clients Only")
     kpi_rows = []
@@ -548,12 +549,6 @@ try:
             out = to_date_only(out, date_cols)
         if "Profit Margin %" in out.columns:
             out["Profit Margin %"] = out["Profit Margin %"].apply(format_pct_str_or_blank)
-        if "ETA Filled %" in out.columns:
-            out["ETA Filled %"] = out["ETA Filled %"].apply(format_pct_str_or_blank)
-        if "Auditable Closed %" in out.columns:
-            out["Auditable Closed %"] = out["Auditable Closed %"].apply(format_pct_str_or_blank)
-        if "Auditable Overall Profit Margin %" in out.columns:
-            out["Auditable Overall Profit Margin %"] = out["Auditable Overall Profit Margin %"].apply(format_pct_str_or_blank)
         return out
 
     st.subheader("Exceptions (Open items) — Auditable Only")
@@ -592,7 +587,6 @@ try:
     # ---------------- Export ----------------
     output = io.BytesIO()
 
-    # For export: convert ETA columns to date
     summary_x = to_date_only(summary, ["ETA"])
     margin_anomalies_x = to_date_only(margin_anomalies, ["ETA"])
     negative_profit_x = to_date_only(negative_profit, ["ETA"])
@@ -602,7 +596,7 @@ try:
     sell_zero_only_x = to_date_only(sell_zero_only, ["ETA"])
     cost_zero_only_x = to_date_only(cost_zero_only, ["ETA"])
     chargecode_profit_le0_mawb_x = to_date_only(chargecode_profit_le0_mawb, ["ETA"])
-    df_x = to_date_only(df, ["ETA"])  # Raw enriched (auditable only)
+    df_x = to_date_only(df, ["ETA"])
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         workbook = writer.book
@@ -612,13 +606,11 @@ try:
         percent_fmt = workbook.add_format({"num_format": "0.00%"})
         number_fmt = workbook.add_format({"num_format": "#,##0.00"})
 
-        # ✅ Summary sheet
         ws = workbook.add_worksheet("Analysis Summary")
         writer.sheets["Analysis Summary"] = ws
         ws.write(0, 0, "Analysis Summary (Auditable Only)", header_fmt)
 
         row = 2
-        # Structural totals (if any)
         if structural_totals:
             ws.write(row, 0, "Structural Client Totals (Excluded from ALL Audit Details)", subheader_fmt)
             row += 1
@@ -636,7 +628,6 @@ try:
             ws.write(row, 6, structural_totals["Note"])
             row += 3
 
-        # Links
         ws.write(row, 0, "Click detail links below:", bold_fmt)
         row += 1
         tab_links = [
@@ -660,7 +651,6 @@ try:
             ws.write_url(row, 0, f"internal:'{sheet_name}'!A1", string=text)
             row += 1
 
-        # KPI table
         row += 1
         ws.write(row, 0, "KPI — Auditable Only", subheader_fmt)
         row += 1
@@ -676,18 +666,14 @@ try:
                 excel_write_number_or_blank(ws, row, 1, v, number_fmt)
             row += 1
 
-        # ---- Other sheets (ALL auditable only; PROCARESX excluded) ----
         exceptions_x.to_excel(writer, index=False, sheet_name="Exceptions")
         summary_x.to_excel(writer, index=False, sheet_name="MAWB_Summary")
         client_summary_x.to_excel(writer, index=False, sheet_name="Client_Summary")
-
         margin_anomalies_x.to_excel(writer, index=False, sheet_name="Margin_Anomalies")
         negative_profit_x.to_excel(writer, index=False, sheet_name="Negative_Profit")
-
         both_zero_x.to_excel(writer, index=False, sheet_name="Both_Zero")
         sell_zero_only_x.to_excel(writer, index=False, sheet_name="Sell_Zero_Only")
         cost_zero_only_x.to_excel(writer, index=False, sheet_name="Cost_Zero_Only")
-
         chargecode_summary.to_excel(writer, index=False, sheet_name="ChargeCode_Summary")
         vendor_summary.to_excel(writer, index=False, sheet_name="Vendor_Summary")
         chargecode_profit_le0_mawb_x.to_excel(writer, index=False, sheet_name="ChargeCode_ProfitLE0_MAWB")
@@ -697,7 +683,6 @@ try:
 
         df_x.to_excel(writer, index=False, sheet_name="Raw_Billing_Enriched")
 
-        # ---- Format % columns to show % symbol in ALL sheets ----
         percent_sheets = {
             "Exceptions": exceptions_x,
             "MAWB_Summary": summary_x,
