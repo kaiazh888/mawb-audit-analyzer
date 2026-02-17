@@ -108,9 +108,9 @@ def to_date_only(df_in: pd.DataFrame, cols: list[str]) -> pd.DataFrame:
     return df_out
 
 def format_pct_str_or_blank(x):
-    """x is ratio (0..1). Return blank for NaN."""
+    """x is ratio (0..1). Return blank for NaN/NA."""
     try:
-        if x is None or (isinstance(x, float) and pd.isna(x)):
+        if x is None or x is pd.NA or pd.isna(x):
             return ""
         return f"{float(x) * 100:.2f}%"
     except Exception:
@@ -124,13 +124,36 @@ def ratio_or_nan(numer: pd.Series, denom: pd.Series) -> pd.Series:
     out.loc[mask] = (numer.loc[mask] / denom0.loc[mask]).astype("float64")
     return out
 
+# ---- Robust NA handling to prevent float(pd.NA) crashes ----
+def is_na(x) -> bool:
+    try:
+        return x is pd.NA or pd.isna(x)
+    except Exception:
+        return x is None
+
+def to_float_or_none(x):
+    """Convert to float if possible; return None for NA/blank."""
+    if is_na(x):
+        return None
+    try:
+        return float(x)
+    except Exception:
+        return None
+
+def excel_write_number_or_blank(ws, r, c, x, num_fmt=None, blank=""):
+    """Write numeric if valid, else blank."""
+    v = to_float_or_none(x)
+    if v is None:
+        ws.write(r, c, blank)
+    else:
+        if num_fmt is None:
+            ws.write_number(r, c, v)
+        else:
+            ws.write_number(r, c, v, num_fmt)
+
 # Excel formatting helpers
 def excel_set_percent_col(ws, col_idx: int, workbook, width: int = 16):
     fmt = workbook.add_format({"num_format": "0.00%"})
-    ws.set_column(col_idx, col_idx, width, fmt)
-
-def excel_set_currency_col(ws, col_idx: int, workbook, width: int = 16):
-    fmt = workbook.add_format({"num_format": "#,##0.00"})
     ws.set_column(col_idx, col_idx, width, fmt)
 
 # ---------------- Uploaders ----------------
@@ -278,7 +301,7 @@ try:
     df_all["ETA"] = pd.to_datetime(df_all["ETA"], errors="coerce").dt.normalize()
 
     # =========================
-    # Structural client totals (PROCARESX)
+    # Structural client totals (PROCARESX) — ONLY totals shown
     # =========================
     structural_df = df_all[df_all["Client"].isin(STRUCTURAL_CLIENTS)].copy()
     structural_totals = None
@@ -294,7 +317,7 @@ try:
             "Total AR": s_sell,
             "Total Profit": s_profit,
             "Profit Margin %": s_margin,
-            "Note": "Structural allocation; excluded from MAWB-level audit & all detail pages"
+            "Note": "Structural allocation; excluded from ALL audit detail pages/exports"
         }
 
     # =========================
@@ -319,7 +342,6 @@ try:
 
     # Classification & Exception Types (auditable only)
     def classification(r):
-        # Open if any critical missingness OR margin outside normal range
         if not (r["Total_Cost"] > 0 and r["Total_Sell"] > 0):
             return "Open"
         pm = r["Profit Margin %"]
@@ -364,7 +386,7 @@ try:
     client_summary["Profit Margin %"] = ratio_or_nan(client_summary["Profit"], client_summary["Total_Sell"])
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
-    # ---- Margin Outliers / Negative Profit ----
+    # ---- Margin Anomalies / Negative Profit ----
     margin_anomalies = summary[
         ((summary["Profit Margin %"] < 0.30) | (summary["Profit Margin %"] > 0.80)) &
         (~summary["Profit Margin %"].isna())
@@ -462,7 +484,7 @@ try:
     total_sell_sum = float(summary["Total_Sell"].sum())
     total_cost_sum = float(summary["Total_Cost"].sum())
     total_profit_sum = float(summary["Profit"].sum())
-    overall_pm = (total_profit_sum / total_sell_sum) if total_sell_sum else None  # show blank if AR=0
+    overall_pm = (total_profit_sum / total_sell_sum) if total_sell_sum else None  # blank if AR=0
 
     neg_profit_cnt = int((summary["Profit"] < 0).sum())
     neg_profit_amt = float(summary.loc[summary["Profit"] < 0, "Profit"].sum())
@@ -498,7 +520,7 @@ try:
 
     # Structural totals block (PROCARESX only totals)
     if structural_totals:
-        st.subheader("Structural Client Totals (Excluded from Audit Detail)")
+        st.subheader("Structural Client Totals (Excluded from ALL Audit Details)")
         tmp = pd.DataFrame([structural_totals])
         tmp_display = tmp.copy()
         tmp_display["Profit Margin %"] = tmp_display["Profit Margin %"].apply(format_pct_str_or_blank)
@@ -510,11 +532,7 @@ try:
         if k in KPI_PCT_KEYS:
             kpi_rows.append({"Metric": k, "Value": format_pct_str_or_blank(v)})
         else:
-            # numbers
-            try:
-                kpi_rows.append({"Metric": k, "Value": v if v is not None else ""})
-            except Exception:
-                kpi_rows.append({"Metric": k, "Value": str(v)})
+            kpi_rows.append({"Metric": k, "Value": "" if is_na(v) else v})
     st.dataframe(pd.DataFrame(kpi_rows), use_container_width=True)
 
     st.subheader("Summary: Profit < 0 (Auditable MAWBs)")
@@ -530,12 +548,12 @@ try:
             out = to_date_only(out, date_cols)
         if "Profit Margin %" in out.columns:
             out["Profit Margin %"] = out["Profit Margin %"].apply(format_pct_str_or_blank)
-        if "Auditable Overall Profit Margin %" in out.columns:
-            out["Auditable Overall Profit Margin %"] = out["Auditable Overall Profit Margin %"].apply(format_pct_str_or_blank)
-        if "Auditable Closed %" in out.columns:
-            out["Auditable Closed %"] = out["Auditable Closed %"].apply(format_pct_str_or_blank)
         if "ETA Filled %" in out.columns:
             out["ETA Filled %"] = out["ETA Filled %"].apply(format_pct_str_or_blank)
+        if "Auditable Closed %" in out.columns:
+            out["Auditable Closed %"] = out["Auditable Closed %"].apply(format_pct_str_or_blank)
+        if "Auditable Overall Profit Margin %" in out.columns:
+            out["Auditable Overall Profit Margin %"] = out["Auditable Overall Profit Margin %"].apply(format_pct_str_or_blank)
         return out
 
     st.subheader("Exceptions (Open items) — Auditable Only")
@@ -584,9 +602,7 @@ try:
     sell_zero_only_x = to_date_only(sell_zero_only, ["ETA"])
     cost_zero_only_x = to_date_only(cost_zero_only, ["ETA"])
     chargecode_profit_le0_mawb_x = to_date_only(chargecode_profit_le0_mawb, ["ETA"])
-
-    # Raw enriched (auditable only) — exclude PROCARESX, include Profit & Profit Margin %
-    df_x = to_date_only(df, ["ETA"])
+    df_x = to_date_only(df, ["ETA"])  # Raw enriched (auditable only)
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         workbook = writer.book
@@ -601,28 +617,22 @@ try:
         writer.sheets["Analysis Summary"] = ws
         ws.write(0, 0, "Analysis Summary (Auditable Only)", header_fmt)
 
-        # Structural totals (if any)
         row = 2
+        # Structural totals (if any)
         if structural_totals:
-            ws.write(row, 0, "Structural Client Totals (Excluded from Audit Detail)", subheader_fmt)
+            ws.write(row, 0, "Structural Client Totals (Excluded from ALL Audit Details)", subheader_fmt)
             row += 1
-            ws.write(row, 0, "Client", bold_fmt)
-            ws.write(row, 1, "MAWB Count", bold_fmt)
-            ws.write(row, 2, "Total AP", bold_fmt)
-            ws.write(row, 3, "Total AR", bold_fmt)
-            ws.write(row, 4, "Total Profit", bold_fmt)
-            ws.write(row, 5, "Profit Margin %", bold_fmt)
-            ws.write(row, 6, "Note", bold_fmt)
+            headers = ["Client", "MAWB Count", "Total AP", "Total AR", "Total Profit", "Profit Margin %", "Note"]
+            for j, h in enumerate(headers):
+                ws.write(row, j, h, bold_fmt)
             row += 1
+
             ws.write(row, 0, structural_totals["Client"])
-            ws.write_number(row, 1, float(structural_totals["MAWB Count"]), number_fmt)
-            ws.write_number(row, 2, float(structural_totals["Total AP"]), number_fmt)
-            ws.write_number(row, 3, float(structural_totals["Total AR"]), number_fmt)
-            ws.write_number(row, 4, float(structural_totals["Total Profit"]), number_fmt)
-            if structural_totals["Profit Margin %"] is None:
-                ws.write(row, 5, "")
-            else:
-                ws.write_number(row, 5, float(structural_totals["Profit Margin %"]), percent_fmt)
+            excel_write_number_or_blank(ws, row, 1, structural_totals["MAWB Count"], number_fmt)
+            excel_write_number_or_blank(ws, row, 2, structural_totals["Total AP"], number_fmt)
+            excel_write_number_or_blank(ws, row, 3, structural_totals["Total AR"], number_fmt)
+            excel_write_number_or_blank(ws, row, 4, structural_totals["Total Profit"], number_fmt)
+            excel_write_number_or_blank(ws, row, 5, structural_totals["Profit Margin %"], percent_fmt)
             ws.write(row, 6, structural_totals["Note"])
             row += 3
 
@@ -661,18 +671,9 @@ try:
         for k, v in kpi_dict.items():
             ws.write(row, 0, k)
             if k in KPI_PCT_KEYS:
-                if v is None:
-                    ws.write(row, 1, "")
-                else:
-                    ws.write_number(row, 1, float(v), percent_fmt)
+                excel_write_number_or_blank(ws, row, 1, v, percent_fmt)
             else:
-                if v is None:
-                    ws.write(row, 1, "")
-                else:
-                    try:
-                        ws.write_number(row, 1, float(v), number_fmt)
-                    except Exception:
-                        ws.write(row, 1, str(v))
+                excel_write_number_or_blank(ws, row, 1, v, number_fmt)
             row += 1
 
         # ---- Other sheets (ALL auditable only; PROCARESX excluded) ----
@@ -694,7 +695,6 @@ try:
         if mawb_keep:
             pd.DataFrame({"MAWB": mawb_not_found}).to_excel(writer, index=False, sheet_name="MAWB_Not_Found")
 
-        # Raw enriched (auditable only)
         df_x.to_excel(writer, index=False, sheet_name="Raw_Billing_Enriched")
 
         # ---- Format % columns to show % symbol in ALL sheets ----
