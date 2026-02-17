@@ -9,8 +9,8 @@ st.title("MAWB Audit Analyzer (Billing-only) — Enhanced")
 st.caption(
     "Upload Billing charges export + optional MAWB→ETA mapping file. "
     "Supports MAWB filter box, profit margin analysis, zero buckets, outliers, negative profit, "
-    "and Charge Code / Vendor summaries. Enhanced with: "
-    "Vendor→Primary Charge Code (audit by Cost) + TLMF AR allocation."
+    "Charge Code / Vendor summaries, Vendor→Primary Charge Code (audit by Cost), "
+    "and TLMF vendor-level AR allocation (MAWB-level AR = sum of all TLMF Sell)."
 )
 
 # ---------------- Helpers ----------------
@@ -48,7 +48,6 @@ def clean_eta_series(s: pd.Series) -> pd.Series:
     s = s.str.replace(r"(?i)^\s*eta\s*[:\-]\s*", "", regex=True)
     s = s.str.replace(r"\s+", " ", regex=True)
 
-    # YYYYMMDD
     yyyymmdd = s.str.match(r"^\d{8}$")
     s2 = s.copy()
     if yyyymmdd.any():
@@ -73,15 +72,21 @@ def normalize_mawb(x: str) -> str:
     if not s or s in {"NAN", "NONE"}:
         return ""
     s_alnum = re.sub(r"[^0-9A-Z]", "", s)
+
+    # digits 11 => 3+8
     if s_alnum.isdigit() and len(s_alnum) == 11:
         return f"{s_alnum[:3]}-{s_alnum[3:]}"
+    # digits 12 => last 11
     if s_alnum.isdigit() and len(s_alnum) == 12:
         s11 = s_alnum[-11:]
         if len(s11) == 11:
             return f"{s11[:3]}-{s11[3:]}"
         return s_alnum
+
+    # keep existing hyphen format if already 3-xxxx
     if "-" in s and len(s.split("-")[0]) == 3:
         return s
+
     return s_alnum or s
 
 def parse_mawb_list(text: str) -> list[str]:
@@ -116,11 +121,7 @@ def excel_set_percent_col(ws, col_idx: int, workbook, width: int = 16):
     fmt = workbook.add_format({"num_format": "0.00%"})
     ws.set_column(col_idx, col_idx, width, fmt)
 
-def excel_set_currency_col(ws, col_idx: int, workbook, width: int = 16):
-    fmt = workbook.add_format({"num_format": "#,##0.00"})
-    ws.set_column(col_idx, col_idx, width, fmt)
-
-# ---- Charge Code → Category mapping (for vendor mapping view; extend if needed) ----
+# ---- Charge Code → Category mapping (audit-friendly) ----
 bucket_defs = {
     "DTRF": "Trucking / Transfer",
     "TLMF": "Delivery Cartage / Last-mile",
@@ -151,7 +152,11 @@ def confidence_from_share(share: float) -> str:
 
 # ---------------- Uploaders ----------------
 billing_file = st.file_uploader("Upload Billing Charges Excel (.xlsx)", type=["xlsx"], key="billing")
-eta_file = st.file_uploader("Optional: Upload MAWB→ETA mapping Excel (.xlsx)", type=["xlsx"], key="eta_mapping")
+eta_file = st.file_uploader(
+    "Optional: Upload MAWB→ETA mapping Excel (.xlsx)",
+    type=["xlsx"],
+    key="eta_mapping"
+)
 
 st.divider()
 st.subheader("Optional Filter: Keep only specified MAWBs")
@@ -162,17 +167,14 @@ mawb_text = st.text_area(
 )
 
 st.divider()
-st.subheader("Enhanced: TLMF AR Allocation (for AR集中 / AP分散)")
+st.subheader("Enhanced: TLMF AR Allocation (Audit logic)")
 enable_tlmf_alloc = st.checkbox("Enable TLMF vendor-level AR allocation (recommended)", value=True)
 alloc_method = st.radio(
-    "Allocation method",
+    "Allocation method (how to allocate MAWB-level TLMF AR to vendors)",
     ["By Cost Share (recommended)", "By Line Count (fallback)"],
     horizontal=True,
     disabled=not enable_tlmf_alloc
 )
-treat_blank_vendor_as_ar_line = st.checkbox("TLMF: treat blank Vendor rows as AR consolidated line", value=True)
-low_cost_threshold = st.number_input("TLMF: low-cost threshold (<=) treated as AR line", min_value=0.0, value=1.0, step=1.0)
-sell_positive_threshold = st.number_input("TLMF: sell positive threshold (>) for AR line", min_value=0.0, value=0.0, step=10.0)
 vendor_margin_low = st.number_input("TLMF vendor anomaly: low margin (<)", min_value=-10.0, max_value=1.0, value=0.30, step=0.05, format="%.2f")
 vendor_margin_high = st.number_input("TLMF vendor anomaly: high margin (>)", min_value=0.0, max_value=10.0, value=0.80, step=0.05, format="%.2f")
 
@@ -300,7 +302,6 @@ try:
         df = df.merge(eta_map, on="MAWB", how="left")
     else:
         df["ETA"] = pd.NaT
-
     df["ETA"] = pd.to_datetime(df["ETA"], errors="coerce").dt.normalize()
 
     # ---- MAWB summary ----
@@ -315,11 +316,10 @@ try:
           )
     )
     summary["ETA Month"] = summary["ETA"].dt.to_period("M").astype(str).replace("NaT", "")
-
     summary["Profit"] = summary["Total_Sell"] - summary["Total_Cost"]
     summary["Profit Margin %"] = pct(summary["Profit"], summary["Total_Sell"])
 
-    # ✅ Classification rule stays MAWB-level (keep your original logic), but margin split for reporting
+    # ✅ MAWB-level Classification rule (keep original)
     def is_closed(r):
         if not (r["Total_Cost"] > 0 and r["Total_Sell"] > 0):
             return "Open"
@@ -330,6 +330,7 @@ try:
 
     summary["Classification"] = summary.apply(is_closed, axis=1)
 
+    # ✅ Exception_Type split for margin
     def exception_type(r):
         if r["Total_Cost"] == 0 and r["Total_Sell"] == 0:
             return "Cost=Sell=0"
@@ -370,7 +371,7 @@ try:
 
     negative_profit = summary[summary["Profit"] < 0].copy().sort_values("Profit")
 
-    # ---- Zero buckets (Profit/Margin) ----
+    # ---- Zero buckets ----
     zero_margin = summary[summary["Profit Margin %"] == 0].copy().sort_values(["Total_Sell", "Total_Cost"], ascending=False)
     zero_profit = summary[summary["Profit"] == 0].copy().sort_values(["Total_Sell", "Total_Cost"], ascending=False)
 
@@ -392,7 +393,6 @@ try:
     chargecode_summary["Profit Margin %"] = pct(chargecode_summary["Profit"], chargecode_summary["Total_Sell"])
     chargecode_summary = chargecode_summary.sort_values("Profit", ascending=False)
 
-    # Charge code exception counts (MAWB-level flags)
     mawb_flags = summary[["MAWB", "Exception_Type"]].copy()
     mawb_charge = df[["MAWB", "Charge Code"]].drop_duplicates()
     cc_exc = mawb_charge.merge(mawb_flags, on="MAWB", how="left")
@@ -517,38 +517,36 @@ try:
             vendor_primary["Secondary_Cost"].fillna(0) / vendor_primary["Primary_Cost"].fillna(0),
             0.0,
         )
+
         vendor_mixed_risk = vendor_primary[
             (vendor_primary["Confidence"] == "Low") | (vendor_primary["Secondary_vs_Primary_Cost_Ratio"] >= 0.50)
         ].copy()
 
         vendor_top5 = vc.groupby("Vendor").head(5).copy()
 
-    # ---------------- Enhanced Module 2: TLMF AR Allocation (Vendor-level) ----------------
+    # ---------------- Enhanced Module 2: TLMF AR Allocation (MAWB-level AR = sum(all TLMF Sell)) ----------------
     tlmf_all_rows = pd.DataFrame()
-    tlmf_ar_lines = pd.DataFrame()
-    tlmf_vendor_cost_lines = pd.DataFrame()
     tlmf_mawb_totals = pd.DataFrame()
     tlmf_alloc = pd.DataFrame()
     tlmf_anomalies = pd.DataFrame()
 
     if enable_tlmf_alloc:
         tlmf_all_rows = df[df["Charge Code"].eq("TLMF")].copy()
+
         if not tlmf_all_rows.empty:
-            is_blank_vendor = tlmf_all_rows["Vendor"].isin(["", "UNKNOWN"])
-            is_low_cost_high_sell = (tlmf_all_rows["Cost Amount"] <= float(low_cost_threshold)) & (
-                tlmf_all_rows["Sell Amount"] > float(sell_positive_threshold)
+            # ✅ MAWB-level totals: AR/AP both computed by summing ALL TLMF rows for each MAWB
+            tlmf_mawb_totals = (
+                tlmf_all_rows.groupby("MAWB", as_index=False)
+                .agg(
+                    TLMF_Total_Sell=("Sell Amount", "sum"),
+                    TLMF_Total_Cost=("Cost Amount", "sum"),
+                    TLMF_Line_Count=("MAWB", "size"),
+                )
             )
-            ar_line_mask = is_low_cost_high_sell | (treat_blank_vendor_as_ar_line & is_blank_vendor)
 
-            tlmf_ar_lines = tlmf_all_rows[ar_line_mask].copy()
-            tlmf_vendor_cost_lines = tlmf_all_rows[~ar_line_mask].copy()
-
-            mawb_sell = tlmf_all_rows.groupby("MAWB", as_index=False)["Sell Amount"].sum().rename(columns={"Sell Amount": "TLMF_Total_Sell"})
-            mawb_cost = tlmf_all_rows.groupby("MAWB", as_index=False)["Cost Amount"].sum().rename(columns={"Cost Amount": "TLMF_Total_Cost"})
-            tlmf_mawb_totals = mawb_sell.merge(mawb_cost, on="MAWB", how="left")
-
+            # Vendor-level cost base (exclude blank/unknown vendors)
             vendor_cost = (
-                tlmf_vendor_cost_lines[~tlmf_vendor_cost_lines["Vendor"].isin(["", "UNKNOWN"])]
+                tlmf_all_rows[~tlmf_all_rows["Vendor"].isin(["", "UNKNOWN"])]
                 .groupby(["MAWB", "Vendor"], as_index=False)
                 .agg(
                     Vendor_TLMF_Cost=("Cost Amount", "sum"),
@@ -557,15 +555,13 @@ try:
             )
 
             if not vendor_cost.empty:
-                tlmf_alloc = vendor_cost.merge(tlmf_mawb_totals, on="MAWB", how="left")
-                tlmf_alloc["TLMF_Total_Sell"] = tlmf_alloc["TLMF_Total_Sell"].fillna(0.0)
-                tlmf_alloc["TLMF_Total_Cost"] = tlmf_alloc["TLMF_Total_Cost"].fillna(0.0)
+                tlmf_alloc = vendor_cost.merge(tlmf_mawb_totals, on="MAWB", how="left").fillna(0.0)
 
                 if alloc_method.startswith("By Cost"):
                     tlmf_alloc["Alloc_Share"] = np.where(
                         tlmf_alloc["TLMF_Total_Cost"] > 0,
                         tlmf_alloc["Vendor_TLMF_Cost"] / tlmf_alloc["TLMF_Total_Cost"],
-                        0.0,
+                        0.0
                     )
                 else:
                     total_lines = tlmf_alloc.groupby("MAWB")["Vendor_Lines"].transform("sum")
@@ -576,16 +572,34 @@ try:
                 tlmf_alloc["Vendor_Margin_Est"] = np.where(
                     tlmf_alloc["Vendor_AR_Allocated"] > 0,
                     tlmf_alloc["Vendor_Profit_Est"] / tlmf_alloc["Vendor_AR_Allocated"],
-                    0.0,
+                    0.0
                 )
 
-                # anomalies
-                mawb_cost_no_ar = tlmf_mawb_totals[(tlmf_mawb_totals["TLMF_Total_Cost"] > 0) & (tlmf_mawb_totals["TLMF_Total_Sell"] == 0)].copy()
-                mawb_cost_no_ar["Anomaly"] = "TLMF: Cost>0 but Total Sell=0 (AR missing/posted elsewhere)"
+            # ---- MAWB-level anomalies ----
+            mawb_cost_no_ar = tlmf_mawb_totals[
+                (tlmf_mawb_totals["TLMF_Total_Cost"] > 0) & (tlmf_mawb_totals["TLMF_Total_Sell"] == 0)
+            ].copy()
+            mawb_cost_no_ar["Anomaly"] = "TLMF: Cost>0 but Total Sell=0 (AR missing/posted elsewhere)"
 
-                mawb_ar_no_cost = tlmf_mawb_totals[(tlmf_mawb_totals["TLMF_Total_Sell"] > 0) & (tlmf_mawb_totals["TLMF_Total_Cost"] == 0)].copy()
-                mawb_ar_no_cost["Anomaly"] = "TLMF: Sell>0 but Total Cost=0 (AP missing/not accrued)"
+            mawb_ar_no_cost = tlmf_mawb_totals[
+                (tlmf_mawb_totals["TLMF_Total_Sell"] > 0) & (tlmf_mawb_totals["TLMF_Total_Cost"] == 0)
+            ].copy()
+            mawb_ar_no_cost["Anomaly"] = "TLMF: Sell>0 but Total Cost=0 (AP missing/not accrued)"
 
+            # Vendor missing: MAWB has TLMF activity but no usable Vendor to allocate to
+            mawb_has_activity = tlmf_mawb_totals[
+                (tlmf_mawb_totals["TLMF_Total_Sell"] > 0) | (tlmf_mawb_totals["TLMF_Total_Cost"] > 0)
+            ][["MAWB"]].copy()
+            mawb_with_vendor_cost = vendor_cost[["MAWB"]].drop_duplicates() if not vendor_cost.empty else pd.DataFrame({"MAWB": []})
+            mawb_vendor_missing = mawb_has_activity.merge(mawb_with_vendor_cost, on="MAWB", how="left", indicator=True)
+            mawb_vendor_missing = mawb_vendor_missing[mawb_vendor_missing["_merge"].eq("left_only")].drop(columns=["_merge"])
+            if not mawb_vendor_missing.empty:
+                mawb_vendor_missing = mawb_vendor_missing.merge(tlmf_mawb_totals, on="MAWB", how="left")
+                mawb_vendor_missing["Anomaly"] = "TLMF: Vendor missing/blank -> cannot allocate AR to vendors"
+
+            # ---- Vendor-level anomalies after allocation ----
+            vendor_anom = pd.DataFrame()
+            if not tlmf_alloc.empty:
                 vendor_anom = tlmf_alloc.copy()
                 vendor_anom["Anomaly"] = ""
                 vendor_anom.loc[vendor_anom["Vendor_Profit_Est"] < 0, "Anomaly"] = "TLMF Vendor: Negative profit after allocation"
@@ -593,14 +607,15 @@ try:
                 vendor_anom.loc[vendor_anom["Vendor_Margin_Est"] > float(vendor_margin_high), "Anomaly"] = f"TLMF Vendor: Margin>{vendor_margin_high:.2f}"
                 vendor_anom = vendor_anom[vendor_anom["Anomaly"].ne("")].copy()
 
-                tlmf_anomalies = pd.concat(
-                    [
-                        mawb_cost_no_ar[["MAWB", "TLMF_Total_Sell", "TLMF_Total_Cost", "Anomaly"]],
-                        mawb_ar_no_cost[["MAWB", "TLMF_Total_Sell", "TLMF_Total_Cost", "Anomaly"]],
-                        vendor_anom[["MAWB", "Vendor", "Vendor_TLMF_Cost", "Vendor_AR_Allocated", "Vendor_Profit_Est", "Vendor_Margin_Est", "Anomaly"]],
-                    ],
-                    ignore_index=True
-                )
+            tlmf_anomalies = pd.concat(
+                [
+                    mawb_cost_no_ar[["MAWB", "TLMF_Total_Sell", "TLMF_Total_Cost", "Anomaly"]],
+                    mawb_ar_no_cost[["MAWB", "TLMF_Total_Sell", "TLMF_Total_Cost", "Anomaly"]],
+                    mawb_vendor_missing[["MAWB", "TLMF_Total_Sell", "TLMF_Total_Cost", "Anomaly"]] if not mawb_vendor_missing.empty else pd.DataFrame(),
+                    vendor_anom[["MAWB", "Vendor", "Vendor_TLMF_Cost", "Vendor_AR_Allocated", "Vendor_Profit_Est", "Vendor_Margin_Est", "Anomaly"]] if not vendor_anom.empty else pd.DataFrame(),
+                ],
+                ignore_index=True
+            )
 
     # ---- KPI / Summary numbers ----
     total_mawb = len(summary)
@@ -660,12 +675,12 @@ try:
         out = df_in.copy()
         if date_cols:
             out = to_date_only(out, date_cols)
-        for c in ["Profit Margin %", "Closed %", "ETA Filled %", "Overall Profit Margin %", "Vendor_Margin_Est", "Alloc_Share"]:
+        for c in ["Profit Margin %", "Closed %", "ETA Filled %", "Overall Profit Margin %", "Vendor_Margin_Est", "Alloc_Share", "Primary_Cost_Share", "Secondary_Cost_Share"]:
             if c in out.columns:
                 out[c] = out[c].apply(format_pct_str)
         return out
 
-    # ---- Your original tabs (kept) ----
+    # ---- Original tabs (kept) ----
     st.subheader("Exceptions (Open items)")
     st.dataframe(display_df(exceptions, date_cols=["ETA"]), use_container_width=True)
 
@@ -705,40 +720,41 @@ try:
     st.subheader("Charge Code Profit <= 0 (by MAWB)")
     st.dataframe(display_df(chargecode_profit_le0_mawb, date_cols=["ETA"]), use_container_width=True)
 
-    # ---- New enhanced tabs ----
+    # ---- Enhanced tabs ----
     st.divider()
     st.subheader("Enhanced: Vendor → Primary Charge Code (Audit by Cost)")
     if vendor_primary.empty:
         st.info("No vendor+chargecode rows available to build vendor→primary mapping.")
     else:
-        vp_show = vendor_primary.copy()
-        vp_show["Primary_Cost_Share"] = vp_show["Primary_Cost_Share"].apply(format_pct_str)
-        vp_show["Secondary_Cost_Share"] = vp_show["Secondary_Cost_Share"].apply(format_pct_str)
-        st.dataframe(vp_show.sort_values(["Confidence", "Vendor_Total_Cost"], ascending=[True, False]), use_container_width=True)
+        st.dataframe(display_df(vendor_primary).sort_values(["Confidence", "Vendor_Total_Cost"], ascending=[True, False]), use_container_width=True)
 
     st.subheader("Enhanced: Vendor Top5 Code Distribution (Evidence)")
     if vendor_top5.empty:
         st.info("No top5 distribution.")
     else:
         vt_show = vendor_top5.copy()
-        vt_show["Cost_Share"] = vt_show["Cost_Share"].apply(format_pct_str)
+        if "Cost_Share" in vt_show.columns:
+            vt_show["Cost_Share"] = vt_show["Cost_Share"].apply(format_pct_str)
         st.dataframe(vt_show, use_container_width=True)
 
     st.subheader("Enhanced: Mixed Vendor Risk List (Needs Review)")
     if vendor_mixed_risk.empty:
         st.info("No mixed vendors under current logic.")
     else:
-        mv_show = vendor_mixed_risk.copy()
-        mv_show["Primary_Cost_Share"] = mv_show["Primary_Cost_Share"].apply(format_pct_str)
-        mv_show["Secondary_Cost_Share"] = mv_show["Secondary_Cost_Share"].apply(format_pct_str)
-        st.dataframe(mv_show.sort_values("Vendor_Total_Cost", ascending=False), use_container_width=True)
+        st.dataframe(display_df(vendor_mixed_risk).sort_values("Vendor_Total_Cost", ascending=False), use_container_width=True)
 
     if enable_tlmf_alloc:
-        st.subheader("Enhanced: TLMF AR Consolidated Lines (Detected)")
-        if tlmf_ar_lines.empty:
-            st.info("No TLMF AR lines detected (or no TLMF rows).")
+        st.subheader("Enhanced: TLMF All Rows (Raw)")
+        if tlmf_all_rows.empty:
+            st.info("No TLMF rows found.")
         else:
-            st.dataframe(tlmf_ar_lines[["MAWB", "Vendor", "Cost Amount", "Sell Amount"]], use_container_width=True)
+            st.dataframe(display_df(tlmf_all_rows), use_container_width=True)
+
+        st.subheader("Enhanced: TLMF MAWB Totals (AR/AP from all TLMF rows)")
+        if tlmf_mawb_totals.empty:
+            st.info("No TLMF totals computed.")
+        else:
+            st.dataframe(display_df(tlmf_mawb_totals), use_container_width=True)
 
         st.subheader("Enhanced: TLMF Vendor Allocation (Allocated AR → Vendor)")
         if tlmf_alloc.empty:
@@ -806,10 +822,9 @@ try:
         if enable_tlmf_alloc:
             tab_links += [
                 ("Enhanced: TLMF All Rows + detail", "TLMF_All"),
-                ("Enhanced: TLMF AR Lines + detail", "TLMF_AR_Lines"),
+                ("Enhanced: TLMF MAWB Totals + detail", "TLMF_MAWB_Totals"),
                 ("Enhanced: TLMF Vendor Alloc + detail", "TLMF_Allocated"),
                 ("Enhanced: TLMF Anomalies + detail", "TLMF_Anomalies"),
-                ("Enhanced: TLMF MAWB Totals + detail", "TLMF_MAWB_Totals"),
             ]
         if mawb_keep:
             tab_links.insert(0, ("MAWB not found from filter + detail", "MAWB_Not_Found"))
@@ -833,7 +848,7 @@ try:
                 try:
                     ws.write_number(kpi_write_row + i, 1, float(v), number_fmt)
                 except Exception:
-                    ws.write(kpi_write_row + i, 1, str(v))
+                    ws.write(ws, kpi_write_row + i, 1, str(v))
 
         # Write original sheets
         exceptions_x.to_excel(writer, index=False, sheet_name="Exceptions")
@@ -861,7 +876,6 @@ try:
 
         if enable_tlmf_alloc:
             tlmf_all_rows.to_excel(writer, index=False, sheet_name="TLMF_All")
-            tlmf_ar_lines.to_excel(writer, index=False, sheet_name="TLMF_AR_Lines")
             tlmf_mawb_totals.to_excel(writer, index=False, sheet_name="TLMF_MAWB_Totals")
             tlmf_alloc.to_excel(writer, index=False, sheet_name="TLMF_Allocated")
             tlmf_anomalies.to_excel(writer, index=False, sheet_name="TLMF_Anomalies")
