@@ -13,7 +13,7 @@ st.caption(
 )
 
 # =========================
-# Config (Audit Control)
+# Config
 # =========================
 STRUCTURAL_CLIENTS = {"PROCARESX"}  # excluded from ALL detail pages/exports; only totals shown
 
@@ -117,155 +117,11 @@ def ratio_or_nan(numer: pd.Series, denom: pd.Series) -> pd.Series:
     out.loc[mask] = (numer.loc[mask] / denom.loc[mask]).astype("float64")
     return out
 
-def is_na(x) -> bool:
-    try:
-        return x is pd.NA or pd.isna(x)
-    except Exception:
-        return x is None
-
-def to_float_or_none(x):
-    if is_na(x):
-        return None
-    try:
-        return float(x)
-    except Exception:
-        return None
-
-def excel_write_number_or_blank(ws, r, c, x, num_fmt=None, blank=""):
-    v = to_float_or_none(x)
-    if v is None:
-        ws.write(r, c, blank)
-    else:
-        if num_fmt is None:
-            ws.write_number(r, c, v)
-        else:
-            ws.write_number(r, c, v, num_fmt)
-
-def excel_set_percent_col(ws, col_idx: int, workbook, width: int = 16):
-    fmt = workbook.add_format({"num_format": "0.00%"})
-    ws.set_column(col_idx, col_idx, width, fmt)
-
 # =========================
-# Integrated View Builders
+# Uploaders
 # =========================
-def build_integrated_view(df: pd.DataFrame, group_key: str) -> pd.DataFrame:
-    """
-    Create integrated view:
-    - TOTAL row per group (Vendor/Client)
-    - breakdown rows per (group, Charge Code)
-    Always include AP/AR/Profit/Margin + counts.
-    """
-    if df.empty:
-        return pd.DataFrame(columns=[group_key, "Charge Code", "AP", "AR", "Profit", "Profit Margin %", "MAWB Count", "Line Count"])
-
-    base = df.copy()
-    base["AP"] = base["Cost Amount"]
-    base["AR"] = base["Sell Amount"]
-    base["Profit"] = base["AR"] - base["AP"]
-
-    # breakdown by (group, charge code)
-    cc = (
-        base.groupby([group_key, "Charge Code"], as_index=False)
-            .agg(
-                AP=("AP", "sum"),
-                AR=("AR", "sum"),
-                Profit=("Profit", "sum"),
-                Line_Count=("MAWB", "size"),
-                MAWB_Count=("MAWB", pd.Series.nunique),
-            )
-    )
-    cc["Profit Margin %"] = ratio_or_nan(cc["Profit"], cc["AR"])
-    cc = cc.rename(columns={"Line_Count": "Line Count", "MAWB_Count": "MAWB Count"})
-
-    # total per group
-    tot = (
-        base.groupby(group_key, as_index=False)
-            .agg(
-                AP=("AP", "sum"),
-                AR=("AR", "sum"),
-                Profit=("Profit", "sum"),
-                Line_Count=("MAWB", "size"),
-                MAWB_Count=("MAWB", pd.Series.nunique),
-            )
-    )
-    tot["Charge Code"] = "(TOTAL)"
-    tot["Profit Margin %"] = ratio_or_nan(tot["Profit"], tot["AR"])
-    tot = tot.rename(columns={"Line_Count": "Line Count", "MAWB_Count": "MAWB Count"})
-
-    out = pd.concat([tot[[group_key, "Charge Code", "AP", "AR", "Profit", "Profit Margin %", "MAWB Count", "Line Count"]],
-                     cc[[group_key, "Charge Code", "AP", "AR", "Profit", "Profit Margin %", "MAWB Count", "Line Count"]]],
-                    ignore_index=True)
-
-    # sort: totals first within each group
-    out["_is_total"] = (out["Charge Code"] == "(TOTAL)").astype(int)
-    out = out.sort_values([group_key, "_is_total", "Profit"], ascending=[True, False, False]).drop(columns=["_is_total"])
-    return out
-
-def build_audit_dashboard(summary: pd.DataFrame, exceptions: pd.DataFrame, df_lines: pd.DataFrame) -> pd.DataFrame:
-    """
-    Audit Control Dashboard table: KPI + exception distribution + amount by exception type.
-    """
-    total_mawb = int(len(summary))
-    closed_cnt = int((summary["Classification"] == "Closed").sum())
-    open_cnt = total_mawb - closed_cnt
-
-    total_ar = float(summary["Total_Sell"].sum())
-    total_ap = float(summary["Total_Cost"].sum())
-    total_profit = float(summary["Profit"].sum())
-    overall_pm = (total_profit / total_ar) if total_ar else np.nan
-
-    # exception distribution (count + amounts)
-    exc = summary.copy()
-    exc["Exception_Type"] = exc["Exception_Type"].fillna("")
-    exc_dist = (
-        exc.groupby("Exception_Type", as_index=False)
-           .agg(
-               MAWB_Count=("MAWB", "count"),
-               AP=("Total_Cost", "sum"),
-               AR=("Total_Sell", "sum"),
-               Profit=("Profit", "sum"),
-           )
-    )
-    exc_dist["Profit Margin %"] = ratio_or_nan(exc_dist["Profit"], exc_dist["AR"])
-    exc_dist = exc_dist.sort_values(["MAWB_Count", "Profit"], ascending=[False, False])
-
-    # headline KPI block as rows
-    kpi_rows = [
-        ("Auditable Total MAWB", total_mawb),
-        ("Auditable Closed Count", closed_cnt),
-        ("Auditable Open Count", open_cnt),
-        ("Auditable Total AP", total_ap),
-        ("Auditable Total AR", total_ar),
-        ("Auditable Total Profit", total_profit),
-        ("Auditable Overall Profit Margin %", overall_pm),
-        ("Open (Exceptions) MAWB Count", int(len(exceptions))),
-    ]
-    kpi_df = pd.DataFrame(kpi_rows, columns=["Metric", "Value"])
-
-    # flatten exception dist with labels
-    exc_dist_out = exc_dist.rename(columns={"Exception_Type": "Exception Type"})
-    # Add a section marker row (for Excel readability)
-    section = pd.DataFrame([{"Metric": "----- Exception Distribution (by MAWB) -----", "Value": ""}])
-    # Convert exc_dist to KPI-like rows (compact)
-    exc_rows = []
-    for _, r in exc_dist_out.iterrows():
-        label = str(r["Exception Type"]) if str(r["Exception Type"]).strip() else "(No Exception)"
-        exc_rows.append({"Metric": f"{label} | MAWB Count", "Value": r["MAWB_Count"]})
-        exc_rows.append({"Metric": f"{label} | AP", "Value": r["AP"]})
-        exc_rows.append({"Metric": f"{label} | AR", "Value": r["AR"]})
-        exc_rows.append({"Metric": f"{label} | Profit", "Value": r["Profit"]})
-        exc_rows.append({"Metric": f"{label} | Profit Margin %", "Value": r["Profit Margin %"]})
-    exc_kpi_df = pd.DataFrame(exc_rows)
-
-    return pd.concat([kpi_df, section, exc_kpi_df], ignore_index=True)
-
-# ---------------- Uploaders ----------------
 billing_file = st.file_uploader("Upload Billing Charges Excel (.xlsx)", type=["xlsx"], key="billing")
-eta_file = st.file_uploader(
-    "Optional: Upload MAWB→ETA mapping Excel (.xlsx)",
-    type=["xlsx"],
-    key="eta_mapping"
-)
+eta_file = st.file_uploader("Optional: Upload MAWB→ETA mapping Excel (.xlsx)", type=["xlsx"], key="eta_mapping")
 
 st.divider()
 st.subheader("Optional Filter: Keep only specified MAWBs")
@@ -275,7 +131,9 @@ mawb_text = st.text_area(
     placeholder="Example:\n999-34022122\n99934022133\n999 34022144"
 )
 
-# ---------------- Config: column candidates ----------------
+# =========================
+# Column candidates
+# =========================
 BILLING_REQUIRED = {
     "MAWB": ["MAWB", "Mawb", "Master AWB", "MasterAWB"],
     "Cost Amount": ["Cost Amount", "Cost", "AP Amount", "Total Cost", "CostAmount"],
@@ -285,18 +143,26 @@ BILLING_OPTIONAL = {
     "Client": ["Client", "Customer", "Account", "Shipper", "Bill To", "Billed To"],
     "Charge Code": ["Charge Code", "ChargeCode", "Charge", "Code"],
     "Vendor": ["Vendor", "Carrier", "Supplier"],
+    # ✅ Destination candidates
+    "Destination": [
+        "Destination", "Dest", "DST", "To", "POD",
+        "Dest Airport", "Destination Airport", "Airport", "To Airport"
+    ],
 }
 ETA_REQUIRED = {
     "MAWB": ["MAWB", "Mawb", "Master AWB", "MasterAWB"],
     "ETA": ["ETA", "Eta", "Estimated Time of Arrival", "Arrival", "Arrival Date", "ETA Date"],
 }
 
-# ---------------- Main ----------------
+# =========================
+# Main
+# =========================
 if not billing_file:
     st.info("Please upload a Billing Charges Excel file to start.")
     st.stop()
 
 try:
+    # ---- Read billing charges ----
     xls = pd.ExcelFile(billing_file)
     billing_sheet = find_sheet_with_required_cols(xls, BILLING_REQUIRED)
     if not billing_sheet:
@@ -315,6 +181,7 @@ try:
     client_col = find_first_col(raw_df, BILLING_OPTIONAL["Client"])
     charge_code_col = find_first_col(raw_df, BILLING_OPTIONAL["Charge Code"])
     vendor_col = find_first_col(raw_df, BILLING_OPTIONAL["Vendor"])
+    dest_col = find_first_col(raw_df, BILLING_OPTIONAL["Destination"])
 
     if not (mawb_col and cost_col and sell_col):
         st.error("Billing sheet found but required columns could not be detected after scanning.")
@@ -335,9 +202,16 @@ try:
     df_all["Vendor"] = df_all[vendor_col].astype(str).str.strip() if vendor_col else "UNKNOWN"
     df_all.loc[df_all["Vendor"].isin(["", "nan", "None"]), "Vendor"] = "UNKNOWN"
 
+    # ✅ Destination
+    if dest_col:
+        df_all["Destination"] = df_all[dest_col].astype(str).str.strip()
+        df_all.loc[df_all["Destination"].isin(["", "nan", "None"]), "Destination"] = ""
+    else:
+        df_all["Destination"] = ""
+
     df_all = df_all[df_all["MAWB"].ne("")].copy()
 
-    # line-level profit/margin (required)
+    # line-level profit/margin (审计要求：每个sell/cost旁边都要有profit/margin)
     df_all["Profit"] = df_all["Sell Amount"] - df_all["Cost Amount"]
     df_all["Profit Margin %"] = ratio_or_nan(df_all["Profit"], df_all["Sell Amount"])
 
@@ -346,15 +220,11 @@ try:
     if mawb_keep:
         before_rows = len(df_all)
         before_mawb = df_all["MAWB"].nunique()
-
         df_all = df_all[df_all["MAWB"].isin(mawb_keep)].copy()
-
         after_rows = len(df_all)
         after_mawb = df_all["MAWB"].nunique()
-
         found_set = set(df_all["MAWB"].unique())
         mawb_not_found = sorted(set(mawb_keep) - found_set)
-
         st.info(
             f"MAWB filter applied: rows {before_rows} → {after_rows}, "
             f"unique MAWB {before_mawb} → {after_mawb}."
@@ -362,7 +232,7 @@ try:
     else:
         mawb_not_found = []
 
-    # ---- Read ETA mapping (optional) ----
+    # ---- ETA mapping ----
     eta_map = None
     eta_parse_note = None
     if eta_file:
@@ -385,9 +255,7 @@ try:
                 bad_eta_rows = int(mdf["ETA"].isna().sum())
                 total_rows = int(len(mdf))
                 if total_rows > 0 and bad_eta_rows > 0:
-                    eta_parse_note = (
-                        f"ETA parsing note: {bad_eta_rows} / {total_rows} ETA values could not be parsed and were left blank."
-                    )
+                    eta_parse_note = f"ETA parsing note: {bad_eta_rows} / {total_rows} ETA values could not be parsed and were left blank."
 
                 eta_map = (
                     mdf.dropna(subset=["MAWB"])
@@ -426,11 +294,18 @@ try:
     # =========================
     df = df_all[~df_all["Client"].isin(STRUCTURAL_CLIENTS)].copy()
 
-    # ---- MAWB summary ----
+    # ---- MAWB summary (✅ include Destination) ----
+    # Destination: first non-empty per MAWB
+    def first_non_empty(series: pd.Series) -> str:
+        s = series.astype(str).replace(["nan", "None"], "").str.strip()
+        s = s[s.ne("")]
+        return s.iloc[0] if len(s) else ""
+
     summary = (
         df.groupby("MAWB", as_index=False)
           .agg(
               Client=("Client", "first"),
+              Destination=("Destination", first_non_empty),  # ✅ added
               Total_Cost=("Cost Amount", "sum"),
               Total_Sell=("Sell Amount", "sum"),
               Line_Count=("MAWB", "size"),
@@ -468,9 +343,19 @@ try:
 
     summary["Classification"] = summary.apply(classification, axis=1)
     summary["Exception_Type"] = summary.apply(exception_type, axis=1)
-    exceptions = summary[summary["Classification"].eq("Open")].copy()
 
-    # ---- Client Summary ----
+    exceptions = summary[summary["Classification"].eq("Open")].copy()
+    margin_anomalies = summary[
+        ((summary["Profit Margin %"] < 0.30) | (summary["Profit Margin %"] > 0.80)) &
+        (~summary["Profit Margin %"].isna())
+    ].copy().sort_values("Profit Margin %")
+    negative_profit = summary[summary["Profit"] < 0].copy().sort_values("Profit")
+
+    both_zero = summary[(summary["Total_Sell"] == 0) & (summary["Total_Cost"] == 0)].copy().sort_values("MAWB")
+    sell_zero_only = summary[(summary["Total_Sell"] == 0) & (summary["Total_Cost"] > 0)].copy().sort_values("Total_Cost", ascending=False)
+    cost_zero_only = summary[(summary["Total_Cost"] == 0) & (summary["Total_Sell"] > 0)].copy().sort_values("Total_Sell", ascending=False)
+
+    # ---- Client Summary (kept) ----
     client_summary = (
         df.groupby("Client", as_index=False)
           .agg(
@@ -485,18 +370,7 @@ try:
     client_summary["Profit Margin %"] = ratio_or_nan(client_summary["Profit"], client_summary["Total_Sell"])
     client_summary = client_summary.sort_values("Profit", ascending=False)
 
-    # ---- Other existing analysis pages ----
-    margin_anomalies = summary[
-        ((summary["Profit Margin %"] < 0.30) | (summary["Profit Margin %"] > 0.80)) &
-        (~summary["Profit Margin %"].isna())
-    ].copy().sort_values("Profit Margin %")
-
-    negative_profit = summary[summary["Profit"] < 0].copy().sort_values("Profit")
-
-    both_zero = summary[(summary["Total_Sell"] == 0) & (summary["Total_Cost"] == 0)].copy().sort_values("MAWB")
-    sell_zero_only = summary[(summary["Total_Sell"] == 0) & (summary["Total_Cost"] > 0)].copy().sort_values("Total_Cost", ascending=False)
-    cost_zero_only = summary[(summary["Total_Cost"] == 0) & (summary["Total_Sell"] > 0)].copy().sort_values("Total_Sell", ascending=False)
-
+    # ---- Charge Code Summary ----
     chargecode_summary = (
         df.groupby("Charge Code", as_index=False)
           .agg(
@@ -510,6 +384,7 @@ try:
     chargecode_summary["Profit Margin %"] = ratio_or_nan(chargecode_summary["Profit"], chargecode_summary["Total_Sell"])
     chargecode_summary = chargecode_summary.sort_values("Profit", ascending=False)
 
+    # ---- Vendor Summary ----
     vendor_summary = (
         df.groupby("Vendor", as_index=False)
           .agg(
@@ -523,10 +398,12 @@ try:
     vendor_summary["Profit Margin %"] = ratio_or_nan(vendor_summary["Profit"], vendor_summary["Total_Sell"])
     vendor_summary = vendor_summary.sort_values("Profit", ascending=False)
 
+    # ---- Charge Code Profit <= 0 by MAWB (✅ include Destination) ----
     cc_mawb = (
         df.groupby(["MAWB", "Charge Code"], as_index=False)
           .agg(
               Client=("Client", "first"),
+              Destination=("Destination", first_non_empty),  # ✅ added
               Vendor=("Vendor", "first"),
               Total_Cost=("Cost Amount", "sum"),
               Total_Sell=("Sell Amount", "sum"),
@@ -536,17 +413,7 @@ try:
     cc_mawb["Profit"] = cc_mawb["Total_Sell"] - cc_mawb["Total_Cost"]
     cc_mawb["Profit Margin %"] = ratio_or_nan(cc_mawb["Profit"], cc_mawb["Total_Sell"])
     cc_mawb["ETA Month"] = pd.to_datetime(cc_mawb["ETA"], errors="coerce").dt.to_period("M").astype(str).replace("NaT", "")
-
-    chargecode_profit_le0_mawb = cc_mawb[cc_mawb["Profit"] <= 0].copy().sort_values(
-        ["Profit", "Total_Sell"], ascending=[True, False]
-    )
-
-    # =========================
-    # NEW: Integrated Views + Audit Dashboard
-    # =========================
-    vendor_integrated_view = build_integrated_view(df, "Vendor")
-    client_integrated_view = build_integrated_view(df, "Client")
-    audit_dashboard = build_audit_dashboard(summary, exceptions, df)
+    chargecode_profit_le0_mawb = cc_mawb[cc_mawb["Profit"] <= 0].copy().sort_values(["Profit", "Total_Sell"], ascending=[True, False])
 
     # ---------------- UI ----------------
     if eta_parse_note:
@@ -562,24 +429,6 @@ try:
         tmp["Profit Margin %"] = tmp["Profit Margin %"].apply(format_pct_str_or_blank)
         st.dataframe(tmp, use_container_width=True)
 
-    st.subheader("Audit Control Dashboard (NEW)")
-    dash_disp = audit_dashboard.copy()
-    dash_disp["Value"] = dash_disp.apply(
-        lambda r: format_pct_str_or_blank(r["Value"]) if str(r["Metric"]).endswith("%") else ("" if is_na(r["Value"]) else r["Value"]),
-        axis=1
-    )
-    st.dataframe(dash_disp, use_container_width=True)
-
-    st.subheader("Vendor Integrated View (NEW)")
-    viv = vendor_integrated_view.copy()
-    viv["Profit Margin %"] = viv["Profit Margin %"].apply(format_pct_str_or_blank)
-    st.dataframe(viv, use_container_width=True)
-
-    st.subheader("Client Integrated View (NEW)")
-    civ = client_integrated_view.copy()
-    civ["Profit Margin %"] = civ["Profit Margin %"].apply(format_pct_str_or_blank)
-    st.dataframe(civ, use_container_width=True)
-
     def display_df(df_in, date_cols=None):
         out = df_in.copy()
         if date_cols:
@@ -588,29 +437,29 @@ try:
             out["Profit Margin %"] = out["Profit Margin %"].apply(format_pct_str_or_blank)
         return out
 
-    st.subheader("Exceptions (Open items) — Auditable Only")
+    st.subheader("MAWB Summary (All) — Auditable Only (✅ Destination included)")
+    st.dataframe(display_df(summary, date_cols=["ETA"]), use_container_width=True)
+
+    st.subheader("Exceptions (Open items) — Auditable Only (✅ Destination included)")
     st.dataframe(display_df(exceptions, date_cols=["ETA"]), use_container_width=True)
 
-    st.subheader("MAWB Summary (All) — Auditable Only")
-    st.dataframe(display_df(summary, date_cols=["ETA"]), use_container_width=True)
+    st.subheader("Margin Anomalies — Auditable Only (✅ Destination included)")
+    st.dataframe(display_df(margin_anomalies, date_cols=["ETA"]), use_container_width=True)
+
+    st.subheader("Negative Profit — Auditable Only (✅ Destination included)")
+    st.dataframe(display_df(negative_profit, date_cols=["ETA"]), use_container_width=True)
+
+    st.subheader("Cost=Sell=0 — Auditable Only (✅ Destination included)")
+    st.dataframe(display_df(both_zero, date_cols=["ETA"]), use_container_width=True)
+
+    st.subheader("Sell=0 ONLY — Auditable Only (✅ Destination included)")
+    st.dataframe(display_df(sell_zero_only, date_cols=["ETA"]), use_container_width=True)
+
+    st.subheader("Cost=0 ONLY — Auditable Only (✅ Destination included)")
+    st.dataframe(display_df(cost_zero_only, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Client Summary — Auditable Only")
     st.dataframe(display_df(client_summary, date_cols=["Latest_ETA"]), use_container_width=True)
-
-    st.subheader("Margin Anomalies — Auditable Only")
-    st.dataframe(display_df(margin_anomalies, date_cols=["ETA"]), use_container_width=True)
-
-    st.subheader("Negative Profit — Auditable Only")
-    st.dataframe(display_df(negative_profit, date_cols=["ETA"]), use_container_width=True)
-
-    st.subheader("Cost=Sell=0 — Auditable Only")
-    st.dataframe(display_df(both_zero, date_cols=["ETA"]), use_container_width=True)
-
-    st.subheader("Sell=0 ONLY — Auditable Only")
-    st.dataframe(display_df(sell_zero_only, date_cols=["ETA"]), use_container_width=True)
-
-    st.subheader("Cost=0 ONLY — Auditable Only")
-    st.dataframe(display_df(cost_zero_only, date_cols=["ETA"]), use_container_width=True)
 
     st.subheader("Charge Code Summary — Auditable Only")
     st.dataframe(display_df(chargecode_summary), use_container_width=True)
@@ -618,63 +467,46 @@ try:
     st.subheader("Vendor Summary — Auditable Only")
     st.dataframe(display_df(vendor_summary), use_container_width=True)
 
-    st.subheader("Charge Code Profit <= 0 (by MAWB) — Auditable Only")
+    st.subheader("Charge Code Profit <= 0 (by MAWB) — Auditable Only (✅ Destination included)")
     st.dataframe(display_df(chargecode_profit_le0_mawb, date_cols=["ETA"]), use_container_width=True)
 
     # ---------------- Export ----------------
     output = io.BytesIO()
 
     summary_x = to_date_only(summary, ["ETA"])
+    exceptions_x = to_date_only(exceptions, ["ETA"])
     margin_anomalies_x = to_date_only(margin_anomalies, ["ETA"])
     negative_profit_x = to_date_only(negative_profit, ["ETA"])
-    exceptions_x = to_date_only(exceptions, ["ETA"])
-    client_summary_x = to_date_only(client_summary, ["Latest_ETA"])
     both_zero_x = to_date_only(both_zero, ["ETA"])
     sell_zero_only_x = to_date_only(sell_zero_only, ["ETA"])
     cost_zero_only_x = to_date_only(cost_zero_only, ["ETA"])
+    client_summary_x = to_date_only(client_summary, ["Latest_ETA"])
     chargecode_profit_le0_mawb_x = to_date_only(chargecode_profit_le0_mawb, ["ETA"])
     df_x = to_date_only(df, ["ETA"])
 
     with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
         workbook = writer.book
-        header_fmt = workbook.add_format({"bold": True, "font_size": 14})
-        subheader_fmt = workbook.add_format({"bold": True, "font_size": 12})
-        bold_fmt = workbook.add_format({"bold": True})
-        percent_fmt = workbook.add_format({"num_format": "0.00%"})
-        number_fmt = workbook.add_format({"num_format": "#,##0.00"})
 
-        # ===== Analysis Summary sheet with links =====
+        def set_percent(ws, dfx, col_name="Profit Margin %"):
+            if col_name in dfx.columns:
+                col = list(dfx.columns).index(col_name)
+                ws.set_column(col, col, 16, workbook.add_format({"num_format": "0.00%"}))
+
+        # Analysis Summary (basic for now)
         ws = workbook.add_worksheet("Analysis Summary")
         writer.sheets["Analysis Summary"] = ws
-        ws.write(0, 0, "Analysis Summary (Auditable Only)", header_fmt)
-
-        row = 2
-
-        # Structural totals (PROCARESX)
-        if structural_totals is not None:
-            ws.write(row, 0, "Structural Client Totals (Excluded from ALL Detail Pages/Exports)", subheader_fmt)
-            row += 1
-            structural_totals.to_excel(writer, index=False, sheet_name="Analysis Summary", startrow=row, startcol=0)
-            # format pm col
-            pm_col = list(structural_totals.columns).index("Profit Margin %")
-            excel_set_percent_col(ws, pm_col, workbook)
-            row += len(structural_totals) + 3
-
-        ws.write(row, 0, "Click detail links below:", bold_fmt)
-        row += 1
+        ws.write(0, 0, "Analysis Summary (Auditable Only)", workbook.add_format({"bold": True, "font_size": 14}))
+        ws.write(2, 0, "Links:", workbook.add_format({"bold": True}))
 
         tab_links = [
-            ("Audit Control Dashboard (NEW)", "Audit Dashboard"),
-            ("Vendor Integrated View (NEW)", "Vendor Integrated View"),
-            ("Client Integrated View (NEW)", "Client Integrated View"),
-            ("Exceptions (Open) — detail", "Exceptions"),
             ("MAWB Summary — detail", "MAWB_Summary"),
-            ("Client Summary — detail", "Client_Summary"),
+            ("Exceptions — detail", "Exceptions"),
             ("Margin Anomalies — detail", "Margin_Anomalies"),
             ("Negative Profit — detail", "Negative_Profit"),
             ("Cost=Sell=0 — detail", "Both_Zero"),
             ("Sell=0 only — detail", "Sell_Zero_Only"),
             ("Cost=0 only — detail", "Cost_Zero_Only"),
+            ("Client Summary — detail", "Client_Summary"),
             ("Charge code summary — detail", "ChargeCode_Summary"),
             ("Vendor summary — detail", "Vendor_Summary"),
             ("ChargeCode Profit<=0 by MAWB — detail", "ChargeCode_ProfitLE0_MAWB"),
@@ -683,24 +515,27 @@ try:
         if mawb_keep:
             tab_links.insert(0, ("MAWB not found from filter — detail", "MAWB_Not_Found"))
 
+        r = 3
         for text, sheet_name in tab_links:
-            ws.write_url(row, 0, f"internal:'{sheet_name}'!A1", string=text)
-            row += 1
+            ws.write_url(r, 0, f"internal:'{sheet_name}'!A1", string=text)
+            r += 1
 
-        # ===== NEW sheets =====
-        audit_dashboard.to_excel(writer, index=False, sheet_name="Audit Dashboard")
-        vendor_integrated_view.to_excel(writer, index=False, sheet_name="Vendor Integrated View")
-        client_integrated_view.to_excel(writer, index=False, sheet_name="Client Integrated View")
+        # Structural totals block
+        if structural_totals is not None:
+            start = r + 2
+            ws.write(start, 0, "Structural Client Totals (Excluded)", workbook.add_format({"bold": True}))
+            structural_totals.to_excel(writer, index=False, sheet_name="Analysis Summary", startrow=start + 1, startcol=0)
+            set_percent(ws, structural_totals)
 
-        # ===== Existing sheets =====
+        # Write other sheets
         exceptions_x.to_excel(writer, index=False, sheet_name="Exceptions")
         summary_x.to_excel(writer, index=False, sheet_name="MAWB_Summary")
-        client_summary_x.to_excel(writer, index=False, sheet_name="Client_Summary")
         margin_anomalies_x.to_excel(writer, index=False, sheet_name="Margin_Anomalies")
         negative_profit_x.to_excel(writer, index=False, sheet_name="Negative_Profit")
         both_zero_x.to_excel(writer, index=False, sheet_name="Both_Zero")
         sell_zero_only_x.to_excel(writer, index=False, sheet_name="Sell_Zero_Only")
         cost_zero_only_x.to_excel(writer, index=False, sheet_name="Cost_Zero_Only")
+        client_summary_x.to_excel(writer, index=False, sheet_name="Client_Summary")
         chargecode_summary.to_excel(writer, index=False, sheet_name="ChargeCode_Summary")
         vendor_summary.to_excel(writer, index=False, sheet_name="Vendor_Summary")
         chargecode_profit_le0_mawb_x.to_excel(writer, index=False, sheet_name="ChargeCode_ProfitLE0_MAWB")
@@ -709,34 +544,29 @@ try:
         if mawb_keep:
             pd.DataFrame({"MAWB": mawb_not_found}).to_excel(writer, index=False, sheet_name="MAWB_Not_Found")
 
-        # ===== Percent formatting across sheets =====
-        percent_targets = [
-            ("Vendor Integrated View", vendor_integrated_view),
-            ("Client Integrated View", client_integrated_view),
+        # percent formatting
+        for sh, dfx in [
+            ("Exceptions", exceptions_x),
             ("MAWB_Summary", summary_x),
-            ("Client_Summary", client_summary_x),
             ("Margin_Anomalies", margin_anomalies_x),
             ("Negative_Profit", negative_profit_x),
-            ("Exceptions", exceptions_x),
             ("Both_Zero", both_zero_x),
             ("Sell_Zero_Only", sell_zero_only_x),
             ("Cost_Zero_Only", cost_zero_only_x),
+            ("Client_Summary", client_summary_x),
             ("ChargeCode_Summary", chargecode_summary),
             ("Vendor_Summary", vendor_summary),
             ("ChargeCode_ProfitLE0_MAWB", chargecode_profit_le0_mawb_x),
             ("Raw_Billing_Enriched", df_x),
-        ]
-
-        for sh, dfx in percent_targets:
-            if sh in writer.sheets and "Profit Margin %" in dfx.columns:
-                ws2 = writer.sheets[sh]
-                pm_col = list(dfx.columns).index("Profit Margin %")
-                excel_set_percent_col(ws2, pm_col, workbook)
+        ]:
+            ws2 = writer.sheets.get(sh)
+            if ws2 is not None:
+                set_percent(ws2, dfx)
 
     st.download_button(
-        "Download Report Excel (Includes NEW Dashboards)",
+        "Download Report Excel (MAWB tabs include Destination)",
         data=output.getvalue(),
-        file_name="MAWB_Audit_Report_WITH_DASHBOARDS.xlsx",
+        file_name="MAWB_Audit_Report_WITH_DESTINATION.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
     )
 
